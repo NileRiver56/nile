@@ -5,9 +5,11 @@ import type {
   Category,
   Coupon,
   DeliveryZone,
+  FeaturedPlacement,
   HomeSection,
   HomeSectionVersion,
   LedgerEntry,
+  MarketingPopup,
   Offer,
   OfferBanner,
   Order,
@@ -47,6 +49,8 @@ interface AdminOverviewPayload {
   homeSections: HomeSection[];
   homeSectionVersions: Record<string, HomeSectionVersion[]>;
   banners: OfferBanner[];
+  popups: MarketingPopup[];
+  featuredPlacements: FeaturedPlacement[];
   offers: Offer[];
   auditLog: AuditLogEntry[];
   staffUsers: Array<{
@@ -68,6 +72,10 @@ const ALL_ADMIN_PERMS = [
   'orders.manage',
   'payouts.release',
   'content.manage',
+  'home.edit',
+  'home.publish',
+  'marketing.manage',
+  'marketing.view',
   'settings.manage',
   'users.manage',
 ];
@@ -399,7 +407,12 @@ export function AdminDashboardPage() {
           { id: 'home-builder' as const, label: `Home Builder (${overview.homeSections.length})` },
           {
             id: 'promotions' as const,
-            label: `Banners & Offers (${overview.banners.length + overview.offers.length})`,
+            label: `Marketing Hub (${
+              overview.banners.length +
+              (overview.popups?.length || 0) +
+              (overview.featuredPlacements?.length || 0) +
+              overview.offers.length
+            })`,
           },
           { id: 'pages' as const, label: `Legal & Pages (${overview.pages.length})` },
           { id: 'settings' as const, label: 'Rates & Payments' },
@@ -618,6 +631,8 @@ export function AdminDashboardPage() {
       {tab === 'promotions' && (
         <AdminPromotionsTab
           banners={overview.banners}
+          popups={overview.popups || []}
+          featuredPlacements={overview.featuredPlacements || []}
           offers={overview.offers}
           categories={overview.categories}
           sellers={overview.sellers}

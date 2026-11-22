@@ -31,6 +31,8 @@ import {
 } from './server/services/security.ts';
 import { smsAdapter } from './server/services/sms.ts';
 import { getStorageAdapter, getStorageStatus, saveUploadedMedia } from './server/services/storage.ts';
+import { ALL_HOME_SECTION_TYPES } from './src/shared/homeSections.ts';
+import type { SiteChromeSettings } from './src/shared/types.ts';
 
 declare global {
   namespace Express {
@@ -76,9 +78,17 @@ async function createApp() {
   const repo = new MarketplaceRepo(db);
 
   // Process any due jobs on startup and every 60 seconds
-  void processPendingJobs(db).catch(() => {});
+  void processPendingJobs(db)
+    .then((summary) => {
+      if (summary.publishedHomeSnapshots > 0) repo.invalidateHomeCache();
+    })
+    .catch(() => {});
   const jobTimer = setInterval(() => {
-    void processPendingJobs(db).catch(() => {});
+    void processPendingJobs(db)
+      .then((summary) => {
+        if (summary.publishedHomeSnapshots > 0) repo.invalidateHomeCache();
+      })
+      .catch(() => {});
   }, 60_000);
   jobTimer.unref();
 
@@ -179,13 +189,13 @@ async function createApp() {
     next();
   }
 
-  function requireAdminPerm(permission?: string) {
+  function requireAdminPerm(...permissions: string[]) {
     return (req: Request, res: Response, next: NextFunction) => {
       if (!req.authUser || !isAdminRole(req.authUser.roleKey)) {
         return res.status(403).json({ error: 'Admin authorization required.' });
       }
-      if (permission && !hasPermission(req.authUser, permission)) {
-        return res.status(403).json({ error: `Missing permission: ${permission}` });
+      if (permissions.length > 0 && !permissions.some((p) => hasPermission(req.authUser, p))) {
+        return res.status(403).json({ error: `Missing permission: ${permissions.join(' or ')}` });
       }
       next();
     };
@@ -244,6 +254,7 @@ async function createApp() {
         return res.status(403).json({ error: 'Invalid cron authorization.' });
       }
       const summary = await processPendingJobs(db);
+      if (summary.publishedHomeSnapshots > 0) repo.invalidateHomeCache();
       res.json(summary);
     } catch (err) {
       next(err);
@@ -254,12 +265,25 @@ async function createApp() {
   app.get('/api/bootstrap', async (req, res, next) => {
     try {
       const locale = req.query.locale === 'ar' ? 'ar' : 'en';
+      const isAdmin = Boolean(req.authUser && isAdminRole(req.authUser.roleKey));
       const wantsDrafts = req.query.includeDrafts === 'true' || req.query.includeDrafts === '1';
-      const includeDrafts = Boolean(wantsDrafts && req.authUser && isAdminRole(req.authUser.roleKey));
+      const includeDrafts = Boolean(wantsDrafts && isAdmin);
+      const asOf = isAdmin && typeof req.query.asOf === 'string' && req.query.asOf.trim() ? req.query.asOf.trim() : null;
+      const audiencePreview =
+        isAdmin && typeof req.query.audiencePreview === 'string' && req.query.audiencePreview.trim()
+          ? req.query.audiencePreview.trim()
+          : null;
+      const device = req.query.device === 'mobile' ? 'mobile' : 'desktop';
+      const isNewVisitor = req.query.newVisitor === 'true' || req.query.newVisitor === '1';
+
       const data = await repo.getBootstrapData({
         isLoggedIn: Boolean(req.authUser),
+        isNewVisitor,
         locale,
         includeDrafts,
+        asOf,
+        audiencePreview,
+        device,
       });
       res.json(data);
     } catch (err) {
@@ -267,11 +291,66 @@ async function createApp() {
     }
   });
 
+  app.post('/api/newsletter/subscribe', rateLimit(15, 60_000), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          email: z.string().email().max(180),
+          locale: z.enum(['en', 'ar']).default('en'),
+          source: z.string().max(60).default('home'),
+        }),
+        req.body
+      );
+      const result = await repo.subscribeNewsletter(body.email, body.locale, body.source);
+      res.status(201).json(result);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
   app.post('/api/banners/:id/track', rateLimit(120, 60_000), async (req, res) => {
     try {
       const body = validateBody(z.object({ event: z.enum(['impression', 'click']) }), req.body);
-      await repo.trackBannerEvent(req.params.id, body.event);
-      res.json({ ok: true });
+      const result = await repo.trackBannerEvent(req.params.id, body.event, {
+        ip: getClientIp(req),
+        userAgent: String(req.headers['user-agent'] || ''),
+        sessionHint: req.authUser?.id || String(req.headers['x-forwarded-for'] || ''),
+      });
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/popups/:id/track', rateLimit(120, 60_000), async (req, res) => {
+    try {
+      const body = validateBody(z.object({ event: z.enum(['impression', 'conversion', 'dismissal']) }), req.body);
+      const result = await repo.trackMarketingEvent({
+        kind: 'popup',
+        id: req.params.id,
+        event: body.event,
+        ip: getClientIp(req),
+        userAgent: String(req.headers['user-agent'] || ''),
+        sessionHint: req.authUser?.id || String(req.headers['x-forwarded-for'] || ''),
+      });
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/featured-placements/:id/track', rateLimit(120, 60_000), async (req, res) => {
+    try {
+      const body = validateBody(z.object({ event: z.enum(['impression', 'click']) }), req.body);
+      const result = await repo.trackMarketingEvent({
+        kind: 'featured',
+        id: req.params.id,
+        event: body.event,
+        ip: getClientIp(req),
+        userAgent: String(req.headers['user-agent'] || ''),
+        sessionHint: req.authUser?.id || String(req.headers['x-forwarded-for'] || ''),
+      });
+      res.json({ ok: true, ...result });
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
     }
@@ -469,6 +548,10 @@ async function createApp() {
     entityType: z.enum(['product_image', 'store_logo', 'store_banner', 'seller_document', 'editorial_image']),
     entityId: z.string().optional(),
     docType: z.string().optional(),
+    folder: z.string().max(60).optional(),
+    alt: z.object({ en: z.string().max(240), ar: z.string().max(240) }).optional(),
+    focalX: z.number().min(0).max(100).optional(),
+    focalY: z.number().min(0).max(100).optional(),
   });
 
   app.post('/api/uploads', requireAuth, rateLimit(30, 60_000), async (req, res) => {
@@ -480,6 +563,10 @@ async function createApp() {
         entityType: body.entityType,
         entityId: body.entityId,
         ownerUserId: req.authUser!.id,
+        folder: body.folder,
+        alt: body.alt ?? null,
+        focalX: body.focalX,
+        focalY: body.focalY,
       });
       if (body.entityType === 'seller_document' && req.authUser!.sellerId) {
         await repo.attachSellerDocument(req.authUser!.sellerId, body.docType || 'commercial_registration', saved.mediaId);
@@ -935,28 +1022,42 @@ async function createApp() {
     }
   });
 
-  // --- Phase B: Admin Home Sections Builder, Offer Banners & Promotions ---
-  const HomeSectionTypeSchema = z.enum([
-    'hero_split',
-    'trust_strip',
-    'departments_bento',
-    'dynamic_products_grid',
-    'verified_stores_grid',
-    'category_spotlight',
-    'flash_deals_countdown',
-    'promo_announcement_split',
-    'brand_manifesto_band',
-    'seller_recruitment_cta',
-    'governorates_coverage_grid',
-    'comparison_table',
-    'newsletter_dispatch',
-    'faq_accordion',
-    'custom_rich_editorial',
-  ]);
+  // --- Home Builder v2: Sections, Templates, Site Chrome & SEO, Page Snapshots, Media Library ---
+  const HomeSectionTypeSchema = z.enum(ALL_HOME_SECTION_TYPES as [string, ...string[]]);
   const HomeSectionStatusSchema = z.enum(['draft', 'published', 'archived']);
-  const HomeSectionAudienceSchema = z.enum(['all', 'guest', 'logged_in', 'arabic', 'english']);
+  const HomeSectionAudienceSchema = z.enum([
+    'all',
+    'guest',
+    'logged_in',
+    'arabic',
+    'english',
+    'new_visitor',
+    'returning',
+  ]);
+  const HomeSectionTargetingSchema = z
+    .object({
+      visitor: z.enum(['all', 'guest', 'logged_in', 'new_visitor', 'returning']).optional(),
+      device: z.enum(['all', 'desktop', 'mobile']).optional(),
+      locale: z.enum(['all', 'en', 'ar']).optional(),
+      governorate: z.string().max(80).optional(),
+    })
+    .optional();
+  const HomeSectionStyleSchema = z
+    .object({
+      surface: z.enum(['ink', 'graphite']).optional(),
+      padding: z.enum(['compact', 'standard', 'spacious']).optional(),
+    })
+    .optional();
 
-  app.get('/api/admin/home-sections', requireAdminPerm('content.manage'), async (_req, res, next) => {
+  app.get('/api/admin/home-builder/state', requireAdminPerm('home.edit', 'content.manage'), async (_req, res, next) => {
+    try {
+      res.json(await repo.adminGetHomeBuilderState());
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/api/admin/home-sections', requireAdminPerm('home.edit', 'content.manage'), async (_req, res, next) => {
     try {
       res.json(await repo.adminListHomeSections());
     } catch (err) {
@@ -964,7 +1065,7 @@ async function createApp() {
     }
   });
 
-  app.post('/api/admin/home-sections', requireAdminPerm('content.manage'), async (req, res) => {
+  app.post('/api/admin/home-sections', requireAdminPerm('home.edit', 'content.manage'), async (req, res) => {
     try {
       const body = validateBody(
         z.object({
@@ -972,20 +1073,32 @@ async function createApp() {
           title: z.object({ en: z.string().min(1).max(200), ar: z.string().min(1).max(200) }),
           content: z.record(z.string(), z.unknown()).default({}),
           status: HomeSectionStatusSchema.optional(),
+          visible: z.boolean().optional(),
           audience: HomeSectionAudienceSchema.optional(),
+          targeting: HomeSectionTargetingSchema,
+          style: HomeSectionStyleSchema,
+          schedulePriority: z.number().int().min(-1000).max(1000).optional(),
           startsAt: z.string().nullable().optional(),
           endsAt: z.string().nullable().optional(),
+          insertAtIndex: z.number().int().min(0).optional(),
         }),
         req.body
       );
-      const section = await repo.adminCreateHomeSection(req.authUser!.id, body, getClientIp(req));
+      const section = await repo.adminCreateHomeSection(
+        req.authUser!.id,
+        {
+          ...body,
+          sectionType: body.sectionType as (typeof ALL_HOME_SECTION_TYPES)[number],
+        },
+        getClientIp(req)
+      );
       res.status(201).json({ section });
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
     }
   });
 
-  app.post('/api/admin/home-sections/reorder', requireAdminPerm('content.manage'), async (req, res) => {
+  app.post('/api/admin/home-sections/reorder', requireAdminPerm('home.edit', 'content.manage'), async (req, res) => {
     try {
       const body = validateBody(z.object({ orderedIds: z.array(z.string().min(1)).min(1) }), req.body);
       const sections = await repo.adminReorderHomeSections(body.orderedIds, req.authUser!.id, getClientIp(req));
@@ -995,7 +1108,7 @@ async function createApp() {
     }
   });
 
-  app.patch('/api/admin/home-sections/:id', requireAdminPerm('content.manage'), async (req, res) => {
+  app.patch('/api/admin/home-sections/:id', requireAdminPerm('home.edit', 'content.manage'), async (req, res) => {
     try {
       const body = validateBody(
         z.object({
@@ -1003,21 +1116,43 @@ async function createApp() {
           title: z.object({ en: z.string().min(1).max(200), ar: z.string().min(1).max(200) }).optional(),
           content: z.record(z.string(), z.unknown()).optional(),
           status: HomeSectionStatusSchema.optional(),
+          visible: z.boolean().optional(),
           audience: HomeSectionAudienceSchema.optional(),
+          targeting: HomeSectionTargetingSchema,
+          style: HomeSectionStyleSchema,
+          schedulePriority: z.number().int().min(-1000).max(1000).optional(),
           startsAt: z.string().nullable().optional(),
           endsAt: z.string().nullable().optional(),
           sortOrder: z.number().int().optional(),
+          changeNote: z.string().max(240).optional(),
         }),
         req.body
       );
-      const section = await repo.adminUpdateHomeSection(req.params.id, req.authUser!.id, body, getClientIp(req));
+      const section = await repo.adminUpdateHomeSection(
+        req.params.id,
+        req.authUser!.id,
+        {
+          ...body,
+          sectionType: body.sectionType as (typeof ALL_HOME_SECTION_TYPES)[number] | undefined,
+        },
+        getClientIp(req)
+      );
       res.json({ section });
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
     }
   });
 
-  app.post('/api/admin/home-sections/:id/rollback', requireAdminPerm('content.manage'), async (req, res) => {
+  app.post('/api/admin/home-sections/:id/duplicate', requireAdminPerm('home.edit', 'content.manage'), async (req, res) => {
+    try {
+      const section = await repo.adminDuplicateHomeSection(req.params.id, req.authUser!.id, getClientIp(req));
+      res.status(201).json({ section });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/admin/home-sections/:id/rollback', requireAdminPerm('home.edit', 'content.manage'), async (req, res) => {
     try {
       const body = validateBody(z.object({ versionId: z.string().min(1) }), req.body);
       const section = await repo.adminRollbackHomeSection(req.params.id, body.versionId, req.authUser!.id, getClientIp(req));
@@ -1027,7 +1162,7 @@ async function createApp() {
     }
   });
 
-  app.delete('/api/admin/home-sections/:id', requireAdminPerm('content.manage'), async (req, res) => {
+  app.delete('/api/admin/home-sections/:id', requireAdminPerm('home.edit', 'content.manage'), async (req, res) => {
     try {
       await repo.adminDeleteHomeSection(req.params.id, req.authUser!.id, getClientIp(req));
       res.json({ ok: true });
@@ -1036,18 +1171,202 @@ async function createApp() {
     }
   });
 
+  app.post('/api/admin/home-builder/publish', requireAdminPerm('home.publish', 'content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          changeNote: z.string().max(240).optional(),
+          scheduledPublishAt: z.string().nullable().optional(),
+        }),
+        req.body || {}
+      );
+      const snapshot = await repo.adminPublishHomePage(req.authUser!.id, body, getClientIp(req));
+      res.status(201).json({ snapshot });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/admin/home-builder/rollback-page', requireAdminPerm('home.publish', 'content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(z.object({ snapshotId: z.string().min(1) }), req.body);
+      const snapshot = await repo.adminRollbackHomePage(body.snapshotId, req.authUser!.id, getClientIp(req));
+      res.json({ snapshot });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.put('/api/admin/home-builder/chrome', requireAdminPerm('home.edit', 'content.manage'), async (req, res) => {
+    try {
+      const LocalizedSchema = z.object({ en: z.string(), ar: z.string() });
+      const body = validateBody(
+        z.object({
+          chrome: z.object({
+            headerLinks: z.array(
+              z.object({
+                id: z.string().min(1),
+                label: LocalizedSchema,
+                url: z.string().min(1).max(300),
+                visible: z.boolean(),
+              })
+            ),
+            showMegaMenu: z.boolean(),
+            megaMenuDepartments: z.array(
+              z.object({
+                slug: z.string().min(1),
+                title: LocalizedSchema,
+                tagline: LocalizedSchema,
+                links: z.array(z.object({ label: LocalizedSchema, url: z.string().min(1).max(300) })),
+              })
+            ),
+            footerColumns: z.array(
+              z.object({
+                id: z.string().min(1),
+                title: LocalizedSchema,
+                links: z.array(z.object({ label: LocalizedSchema, url: z.string().min(1).max(300) })),
+              })
+            ),
+            footerNote: LocalizedSchema,
+            paymentBadges: z.array(z.string().max(60)),
+            homeSeo: z.object({
+              title: LocalizedSchema,
+              description: LocalizedSchema,
+              ogImageUrl: z.string().max(500),
+            }),
+          }),
+          publishNow: z.boolean().default(false),
+        }),
+        req.body
+      );
+      if (body.publishNow && !hasPermission(req.authUser, 'home.publish') && !hasPermission(req.authUser, 'content.manage')) {
+        return res.status(403).json({ error: 'Missing permission: home.publish' });
+      }
+      const saved = await repo.adminSaveSiteChrome(
+        body.chrome as SiteChromeSettings,
+        body.publishNow,
+        req.authUser!.id,
+        getClientIp(req)
+      );
+      res.json({ chrome: saved });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.get('/api/admin/home-builder/templates', requireAdminPerm('home.edit', 'content.manage'), async (_req, res, next) => {
+    try {
+      res.json({ templates: await repo.adminListSectionTemplates() });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/admin/home-builder/templates', requireAdminPerm('home.edit', 'content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          name: z.object({ en: z.string().min(2).max(160), ar: z.string().min(1).max(160) }),
+          description: z.object({ en: z.string().max(300), ar: z.string().max(300) }).optional(),
+          sectionType: HomeSectionTypeSchema,
+          content: z.record(z.string(), z.unknown()),
+          style: HomeSectionStyleSchema,
+        }),
+        req.body
+      );
+      const template = await repo.adminCreateSectionTemplate(
+        req.authUser!.id,
+        {
+          ...body,
+          sectionType: body.sectionType as (typeof ALL_HOME_SECTION_TYPES)[number],
+        },
+        getClientIp(req)
+      );
+      res.status(201).json({ template });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.delete('/api/admin/home-builder/templates/:id', requireAdminPerm('home.edit', 'content.manage'), async (req, res) => {
+    try {
+      await repo.adminDeleteSectionTemplate(req.params.id, req.authUser!.id, getClientIp(req));
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.get('/api/admin/media', requireAdminPerm('home.edit', 'content.manage'), async (req, res, next) => {
+    try {
+      const folder = typeof req.query.folder === 'string' ? req.query.folder : undefined;
+      res.json({ media: await repo.adminListMediaLibrary(folder) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.patch('/api/admin/media/:id', requireAdminPerm('home.edit', 'content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          folder: z.string().max(60).optional(),
+          alt: z.object({ en: z.string().max(240), ar: z.string().max(240) }).optional(),
+          focalX: z.number().min(0).max(100).optional(),
+          focalY: z.number().min(0).max(100).optional(),
+        }),
+        req.body
+      );
+      const asset = await repo.adminUpdateMediaAsset(req.params.id, body);
+      res.json({ asset });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.delete('/api/admin/media/:id', requireAdminPerm('home.edit', 'content.manage'), async (req, res) => {
+    try {
+      await repo.adminDeleteMediaAsset(req.params.id, req.authUser!.id, getClientIp(req));
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
   const BannerPagesSchema = z.array(z.enum(['home', 'catalog', 'checkout', 'store'])).min(1);
   const BannerBgSchema = z.enum(['graphite', 'ember', 'cedar', 'gold', 'cyan', 'sand']);
+  const BannerPlacementSchema = z.enum(['top_bar', 'page_strip', 'category_header', 'inline_card', 'floating_strip']);
+  const MarketingAudienceSchema = z.enum(['all', 'guest', 'logged_in', 'arabic', 'english']);
+  const DeviceTargetSchema = z.enum(['all', 'desktop', 'mobile']);
+  const SafeNavUrlSchema = z
+    .string()
+    .min(1)
+    .max(400)
+    .refine((v) => !/^\s*(javascript|data|vbscript):/i.test(v), 'Unsafe URL scheme');
 
-  app.post('/api/admin/banners', requireAdminPerm('content.manage'), async (req, res) => {
+  app.get('/api/admin/banners', requireAdminPerm('marketing.view', 'marketing.manage', 'content.manage'), async (_req, res, next) => {
+    try {
+      res.json({ banners: await repo.adminListBanners() });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/admin/banners', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
     try {
       const body = validateBody(
         z.object({
           title: z.object({ en: z.string().min(2).max(240), ar: z.string().min(1).max(240) }),
           ctaLabel: z.object({ en: z.string().max(80), ar: z.string().max(80) }).optional(),
           bgToken: BannerBgSchema.default('graphite'),
-          targetUrl: z.string().min(1).max(400).default('/catalog'),
+          targetUrl: SafeNavUrlSchema.default('/catalog'),
           pages: BannerPagesSchema.default(['home']),
+          placement: BannerPlacementSchema.default('page_strip'),
+          imageUrl: z.string().max(500).nullable().optional(),
+          dismissible: z.boolean().optional(),
+          audience: MarketingAudienceSchema.default('all'),
+          deviceTarget: DeviceTargetSchema.default('all'),
+          categorySlug: z.string().max(120).nullable().optional(),
           priority: z.number().int().min(0).max(1000).optional(),
           startsAt: z.string().nullable().optional(),
           endsAt: z.string().nullable().optional(),
@@ -1062,15 +1381,21 @@ async function createApp() {
     }
   });
 
-  app.patch('/api/admin/banners/:id', requireAdminPerm('content.manage'), async (req, res) => {
+  app.patch('/api/admin/banners/:id', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
     try {
       const body = validateBody(
         z.object({
           title: z.object({ en: z.string().min(2).max(240), ar: z.string().min(1).max(240) }).optional(),
           ctaLabel: z.object({ en: z.string().max(80), ar: z.string().max(80) }).optional(),
           bgToken: BannerBgSchema.optional(),
-          targetUrl: z.string().min(1).max(400).optional(),
+          targetUrl: SafeNavUrlSchema.optional(),
           pages: BannerPagesSchema.optional(),
+          placement: BannerPlacementSchema.optional(),
+          imageUrl: z.string().max(500).nullable().optional(),
+          dismissible: z.boolean().optional(),
+          audience: MarketingAudienceSchema.optional(),
+          deviceTarget: DeviceTargetSchema.optional(),
+          categorySlug: z.string().max(120).nullable().optional(),
           priority: z.number().int().min(0).max(1000).optional(),
           startsAt: z.string().nullable().optional(),
           endsAt: z.string().nullable().optional(),
@@ -1085,9 +1410,166 @@ async function createApp() {
     }
   });
 
-  app.delete('/api/admin/banners/:id', requireAdminPerm('content.manage'), async (req, res) => {
+  app.delete('/api/admin/banners/:id', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
     try {
       await repo.adminDeleteBanner(req.params.id, req.authUser!.id, getClientIp(req));
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  // --- Marketing Popups & Frequency Caps ---
+  const PopupTypeSchema = z.enum(['promo', 'newsletter', 'announcement', 'exit_intent', 'cart_reminder']);
+  const PopupTriggerSchema = z.enum(['delay_seconds', 'scroll_percent', 'exit_intent', 'cart_abandon', 'immediate']);
+  const PopupFrequencySchema = z.enum(['once_per_session', 'once_per_day', 'once_per_week', 'once_ever']);
+
+  app.get('/api/admin/popups', requireAdminPerm('marketing.view', 'marketing.manage', 'content.manage'), async (_req, res, next) => {
+    try {
+      res.json({ popups: await repo.adminListPopups() });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/admin/popups', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          title: z.object({ en: z.string().min(2).max(200), ar: z.string().min(1).max(200) }),
+          body: z.object({ en: z.string().min(2).max(600), ar: z.string().min(1).max(600) }),
+          ctaLabel: z.object({ en: z.string().min(1).max(80), ar: z.string().min(1).max(80) }),
+          targetUrl: SafeNavUrlSchema.default('/catalog'),
+          imageUrl: z.string().max(500).nullable().optional(),
+          bgToken: BannerBgSchema.default('ember'),
+          popupType: PopupTypeSchema.default('promo'),
+          triggerType: PopupTriggerSchema.default('delay_seconds'),
+          triggerValue: z.number().int().min(0).max(300).default(5),
+          frequencyCap: PopupFrequencySchema.default('once_per_day'),
+          pages: BannerPagesSchema.default(['home']),
+          audience: MarketingAudienceSchema.default('all'),
+          deviceTarget: DeviceTargetSchema.default('all'),
+          showNewsletterForm: z.boolean().optional(),
+          couponCode: z.string().max(64).nullable().optional(),
+          startsAt: z.string().nullable().optional(),
+          endsAt: z.string().nullable().optional(),
+          active: z.boolean().optional(),
+        }),
+        req.body
+      );
+      const popup = await repo.adminCreatePopup(req.authUser!.id, body, getClientIp(req));
+      res.status(201).json({ popup });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.patch('/api/admin/popups/:id', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          title: z.object({ en: z.string().min(2).max(200), ar: z.string().min(1).max(200) }).optional(),
+          body: z.object({ en: z.string().min(2).max(600), ar: z.string().min(1).max(600) }).optional(),
+          ctaLabel: z.object({ en: z.string().min(1).max(80), ar: z.string().min(1).max(80) }).optional(),
+          targetUrl: SafeNavUrlSchema.optional(),
+          imageUrl: z.string().max(500).nullable().optional(),
+          bgToken: BannerBgSchema.optional(),
+          popupType: PopupTypeSchema.optional(),
+          triggerType: PopupTriggerSchema.optional(),
+          triggerValue: z.number().int().min(0).max(300).optional(),
+          frequencyCap: PopupFrequencySchema.optional(),
+          pages: BannerPagesSchema.optional(),
+          audience: MarketingAudienceSchema.optional(),
+          deviceTarget: DeviceTargetSchema.optional(),
+          showNewsletterForm: z.boolean().optional(),
+          couponCode: z.string().max(64).nullable().optional(),
+          startsAt: z.string().nullable().optional(),
+          endsAt: z.string().nullable().optional(),
+          active: z.boolean().optional(),
+        }),
+        req.body
+      );
+      const popup = await repo.adminUpdatePopup(req.params.id, req.authUser!.id, body, getClientIp(req));
+      res.json({ popup });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.delete('/api/admin/popups/:id', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      await repo.adminDeletePopup(req.params.id, req.authUser!.id, getClientIp(req));
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  // --- Featured Placements (with atomic Ledger Fee billing option) ---
+  const FeaturedSlotSchema = z.enum([
+    'home_hero_spotlight',
+    'home_trending_top',
+    'catalog_top_sponsored',
+    'category_top_spotlight',
+    'search_promoted',
+  ]);
+
+  app.get('/api/admin/featured-placements', requireAdminPerm('marketing.view', 'marketing.manage', 'content.manage'), async (_req, res, next) => {
+    try {
+      res.json({ featuredPlacements: await repo.adminListFeaturedPlacements() });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/admin/featured-placements', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          slotKey: FeaturedSlotSchema,
+          targetType: z.enum(['product', 'store']),
+          targetId: z.string().min(1).max(64),
+          badgeText: z.object({ en: z.string().min(1).max(60), ar: z.string().min(1).max(60) }).default({ en: 'Featured', ar: 'مميز' }),
+          priority: z.number().int().min(0).max(1000).optional(),
+          feeUsdCents: z.number().int().min(0).max(10_000_000).optional(),
+          chargeLedgerFee: z.boolean().optional(),
+          startsAt: z.string().nullable().optional(),
+          endsAt: z.string().nullable().optional(),
+          active: z.boolean().optional(),
+        }),
+        req.body
+      );
+      const placement = await repo.adminCreateFeaturedPlacement(req.authUser!.id, body, getClientIp(req));
+      res.status(201).json({ featuredPlacement: placement });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.patch('/api/admin/featured-placements/:id', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          slotKey: FeaturedSlotSchema.optional(),
+          badgeText: z.object({ en: z.string().min(1).max(60), ar: z.string().min(1).max(60) }).optional(),
+          priority: z.number().int().min(0).max(1000).optional(),
+          startsAt: z.string().nullable().optional(),
+          endsAt: z.string().nullable().optional(),
+          active: z.boolean().optional(),
+          chargeLedgerFeeNow: z.boolean().optional(),
+        }),
+        req.body
+      );
+      const placement = await repo.adminUpdateFeaturedPlacement(req.params.id, req.authUser!.id, body, getClientIp(req));
+      res.json({ featuredPlacement: placement });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.delete('/api/admin/featured-placements/:id', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      await repo.adminDeleteFeaturedPlacement(req.params.id, req.authUser!.id, getClientIp(req));
       res.json({ ok: true });
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });

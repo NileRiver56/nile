@@ -3,18 +3,22 @@ import type {
   Category,
   Currency,
   DeliveryZone,
+  FeaturedPlacement,
   HomeSection,
   Locale,
+  MarketingPopup,
   Offer,
   OfferBanner,
   PaymentConfig,
   PlatformSettings,
   Product,
   Seller,
+  SiteChromeSettings,
   SubscriptionPlan,
   ThemeMode,
   UserRole,
 } from '../shared/types.ts';
+import { DEFAULT_SITE_CHROME } from '../shared/homeSections.ts';
 import { getCopy } from '../shared/i18n.ts';
 
 export interface CartItem {
@@ -61,7 +65,10 @@ interface MarketplaceContextValue {
   subscriptionPlans: SubscriptionPlan[];
   deliveryZones: DeliveryZone[];
   homeSections: HomeSection[];
+  siteChrome: SiteChromeSettings;
   banners: OfferBanner[];
+  popups: MarketingPopup[];
+  featuredPlacements: FeaturedPlacement[];
   offers: Offer[];
   previewDrafts: boolean;
   setPreviewDrafts: (v: boolean) => void;
@@ -142,7 +149,10 @@ export function MarketplaceProvider({ children }: { children: React.ReactNode })
   const [subscriptionPlans, setSubscriptionPlans] = useState<SubscriptionPlan[]>([]);
   const [deliveryZones, setDeliveryZones] = useState<DeliveryZone[]>([]);
   const [homeSections, setHomeSections] = useState<HomeSection[]>([]);
+  const [siteChrome, setSiteChrome] = useState<SiteChromeSettings>(DEFAULT_SITE_CHROME);
   const [banners, setBanners] = useState<OfferBanner[]>([]);
+  const [popups, setPopups] = useState<MarketingPopup[]>([]);
+  const [featuredPlacements, setFeaturedPlacements] = useState<FeaturedPlacement[]>([]);
   const [offers, setOffers] = useState<Offer[]>([]);
   const [previewDrafts, setPreviewDrafts] = useState<boolean>(() => {
     const p = new URLSearchParams(window.location.search);
@@ -264,7 +274,10 @@ export function MarketplaceProvider({ children }: { children: React.ReactNode })
       setSubscriptionPlans(data.subscriptionPlans || []);
       setDeliveryZones(data.deliveryZones || []);
       setHomeSections(data.homeSections || []);
+      setSiteChrome(data.siteChrome || DEFAULT_SITE_CHROME);
       setBanners(data.banners || []);
+      setPopups(data.popups || []);
+      setFeaturedPlacements(data.featuredPlacements || []);
       setOffers(data.offers || []);
     } catch {
       showToast('Failed to load marketplace catalog.', 'error');
@@ -435,7 +448,10 @@ export function MarketplaceProvider({ children }: { children: React.ReactNode })
         subscriptionPlans,
         deliveryZones,
         homeSections,
+        siteChrome,
         banners,
+        popups,
+        featuredPlacements,
         offers,
         previewDrafts,
         setPreviewDrafts,

@@ -1,7 +1,14 @@
 import crypto from 'node:crypto';
 import type { DbClient } from './client.ts';
 import { DEFAULT_DELIVERY_ZONES } from '../../src/shared/lebanon.ts';
-import { HOME_SECTION_PRESETS } from '../../src/shared/homeSections.ts';
+import {
+  DEFAULT_SITE_CHROME,
+  HOME_SECTION_PRESETS,
+  STARTER_TEMPLATES,
+  migrateLegacySectionPayload,
+  normalizeTargeting,
+} from '../../src/shared/homeSections.ts';
+import type { HomeMigrationReport } from '../../src/shared/types.ts';
 
 const ESSENTIAL_ROLES = [
   { key: 'customer', name: 'Customer', description: 'Shop, manage orders, addresses, wishlist, and verified reviews.' },
@@ -17,6 +24,10 @@ const ESSENTIAL_PERMISSIONS = [
   { key: 'orders.manage', description: 'Manage orders, sub-orders, courier assignments, and refunds' },
   { key: 'payouts.release', description: 'Release escrow holds and settle seller payout requests' },
   { key: 'content.manage', description: 'Edit home sections, offer banners, menus, and static pages' },
+  { key: 'home.edit', description: 'Edit draft home sections, chrome, and templates' },
+  { key: 'home.publish', description: 'Publish home page snapshots and rollback versions' },
+  { key: 'marketing.manage', description: 'Create and edit banners, popups, featured placements, offers, coupons, and campaigns' },
+  { key: 'marketing.view', description: 'View marketing analytics and campaign reports' },
   { key: 'settings.manage', description: 'Edit exchange rate, commissions, delivery zones, and SMTP/storage' },
   { key: 'users.manage', description: 'Create admin staff and assign granular permissions' },
   { key: 'seller.catalog', description: 'Create and edit store products and inventory' },
@@ -30,12 +41,19 @@ const ROLE_PERMISSION_MAP: Array<[string, string]> = [
   ['admin_super', 'orders.manage'],
   ['admin_super', 'payouts.release'],
   ['admin_super', 'content.manage'],
+  ['admin_super', 'home.edit'],
+  ['admin_super', 'home.publish'],
+  ['admin_super', 'marketing.manage'],
+  ['admin_super', 'marketing.view'],
   ['admin_super', 'settings.manage'],
   ['admin_super', 'users.manage'],
   ['admin_staff', 'sellers.approve'],
   ['admin_staff', 'products.approve'],
   ['admin_staff', 'orders.manage'],
   ['admin_staff', 'content.manage'],
+  ['admin_staff', 'home.edit'],
+  ['admin_staff', 'marketing.manage'],
+  ['admin_staff', 'marketing.view'],
   ['seller_owner', 'seller.catalog'],
   ['seller_owner', 'seller.orders'],
   ['seller_owner', 'seller.finance'],
@@ -155,43 +173,185 @@ const ESSENTIAL_PAGES = [
   },
 ];
 
-async function ensureDefaultHomeSections(db: DbClient): Promise<void> {
-  const countRow = await db.queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM home_sections');
-  if (countRow && Number(countRow.cnt) > 0) return;
+async function migrateLegacyHomeSections(db: DbClient): Promise<void> {
+  const rows = await db.query<{
+    id: string;
+    section_type: string;
+    title_json: string | Record<string, unknown>;
+    content_json: string | Record<string, unknown>;
+    status: string;
+    audience: string;
+    targeting_json: string | null;
+  }>('SELECT id, section_type, title_json, content_json, status, audience, targeting_json FROM home_sections');
 
-  const starterTypes = [
-    'hero_split',
-    'trust_strip',
-    'departments_bento',
-    'dynamic_products_grid',
-    'verified_stores_grid',
-  ] as const;
+  if (rows.length === 0) return;
 
-  const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
-  for (let i = 0; i < starterTypes.length; i++) {
-    const preset = HOME_SECTION_PRESETS.find((p) => p.type === starterTypes[i]);
-    if (!preset) continue;
-    const id = `hs-${starterTypes[i]}`;
-    const verId = `hsv-${crypto.randomUUID()}`;
-    const snapshot = {
-      sectionType: preset.type,
-      title: preset.defaultTitle,
-      content: preset.defaultContent,
-      status: 'published',
-      audience: 'all',
-      startsAt: null,
-      endsAt: null,
-    };
+  const migratedSections: HomeMigrationReport['migratedSections'] = [];
+  let alreadyUpToDateCount = 0;
 
-    await db.execute(
-      `INSERT INTO home_sections (id, section_type, title_json, content_json, sort_order, status, audience, starts_at, ends_at, version, updated_at)
-       VALUES (?, ?, ?, ?, ?, 'published', 'all', NULL, NULL, 1, ?)`,
-      [id, preset.type, JSON.stringify(preset.defaultTitle), JSON.stringify(preset.defaultContent), (i + 1) * 10, now]
+  for (const row of rows) {
+    const rawContent =
+      typeof row.content_json === 'string'
+        ? (JSON.parse(row.content_json) as Record<string, unknown>)
+        : ((row.content_json || {}) as Record<string, unknown>);
+    const rawTitle =
+      typeof row.title_json === 'string'
+        ? (JSON.parse(row.title_json) as { en?: string; ar?: string })
+        : ((row.title_json || {}) as { en?: string; ar?: string });
+
+    const { toType, content, changed } = migrateLegacySectionPayload(row.section_type, rawContent);
+    const targeting = normalizeTargeting(
+      row.targeting_json ? (typeof row.targeting_json === 'string' ? JSON.parse(row.targeting_json) : row.targeting_json) : null,
+      row.audience
     );
+
+    if (changed || !row.targeting_json) {
+      await db.execute(
+        'UPDATE home_sections SET section_type = ?, content_json = ?, targeting_json = ? WHERE id = ?',
+        [toType, JSON.stringify(content), JSON.stringify(targeting), row.id]
+      );
+    }
+
+    if (changed) {
+      migratedSections.push({
+        id: row.id,
+        fromType: row.section_type,
+        toType,
+        titleEn: rawTitle.en || row.id,
+        status: row.status,
+      });
+    } else {
+      alreadyUpToDateCount++;
+    }
+  }
+
+  let migratedVersionsCount = 0;
+  const versionRows = await db.query<{ id: string; snapshot_json: string | Record<string, unknown> }>(
+    'SELECT id, snapshot_json FROM home_section_versions'
+  );
+  for (const vr of versionRows) {
+    const snap =
+      typeof vr.snapshot_json === 'string'
+        ? (JSON.parse(vr.snapshot_json) as Record<string, unknown>)
+        : ((vr.snapshot_json || {}) as Record<string, unknown>);
+    const rawType = String(snap.sectionType || '');
+    const rawContent = (snap.content || {}) as Record<string, unknown>;
+    const { toType, content, changed } = migrateLegacySectionPayload(rawType, rawContent);
+    if (changed) {
+      const nextSnap = { ...snap, sectionType: toType, content };
+      await db.execute('UPDATE home_section_versions SET snapshot_json = ? WHERE id = ?', [
+        JSON.stringify(nextSnap),
+        vr.id,
+      ]);
+      migratedVersionsCount++;
+    }
+  }
+
+  if (migratedSections.length > 0 || migratedVersionsCount > 0) {
+    const report: HomeMigrationReport = {
+      ranAt: new Date().toISOString(),
+      migratedSections,
+      migratedVersionsCount,
+      alreadyUpToDateCount,
+    };
+    const keyCol = db.driver === 'mysql' ? '`key`' : 'key';
     await db.execute(
-      `INSERT INTO home_section_versions (id, section_id, version, snapshot_json, edited_by_user_id, created_at)
-       VALUES (?, ?, 1, ?, NULL, ?)`,
-      [verId, id, JSON.stringify(snapshot), now]
+      db.driver === 'mysql'
+        ? `INSERT INTO settings (${keyCol}, value_json) VALUES (?, ?) ON DUPLICATE KEY UPDATE value_json = VALUES(value_json)`
+        : `INSERT INTO settings (${keyCol}, value_json) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json`,
+      ['home_migration_report', JSON.stringify(report)]
+    );
+    console.log(
+      `[NILELINK HOME MIGRATION] Migrated ${migratedSections.length} home sections and ${migratedVersionsCount} version snapshots from 15->18 practical blocks.`
+    );
+  }
+}
+
+async function ensureDefaultHomeSections(db: DbClient): Promise<void> {
+  await migrateLegacyHomeSections(db);
+
+  const countRow = await db.queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM home_sections');
+  const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+
+  if (!countRow || Number(countRow.cnt) === 0) {
+    const starterTypes = ['hero', 'trust_cells', 'category_tiles', 'product_grid', 'featured_stores'] as const;
+
+    for (let i = 0; i < starterTypes.length; i++) {
+      const preset = HOME_SECTION_PRESETS.find((p) => p.type === starterTypes[i]);
+      if (!preset) continue;
+      const id = `hs-${starterTypes[i]}`;
+      const verId = `hsv-${crypto.randomUUID()}`;
+      const targeting = normalizeTargeting(null, 'all');
+      const style = { surface: 'graphite', padding: 'standard' };
+      const snapshot = {
+        sectionType: preset.type,
+        title: preset.defaultTitle,
+        content: preset.defaultContent,
+        status: 'published',
+        visible: true,
+        audience: 'all',
+        targeting,
+        style,
+        startsAt: null,
+        endsAt: null,
+      };
+
+      await db.execute(
+        `INSERT INTO home_sections (id, section_type, title_json, content_json, sort_order, status, visible, audience, targeting_json, style_json, schedule_priority, starts_at, ends_at, version, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'published', 1, 'all', ?, ?, 0, NULL, NULL, 1, ?)`,
+        [
+          id,
+          preset.type,
+          JSON.stringify(preset.defaultTitle),
+          JSON.stringify(preset.defaultContent),
+          (i + 1) * 10,
+          JSON.stringify(targeting),
+          JSON.stringify(style),
+          now,
+        ]
+      );
+      await db.execute(
+        `INSERT INTO home_section_versions (id, section_id, version, change_note, snapshot_json, edited_by_user_id, created_at)
+         VALUES (?, ?, 1, 'Initial default section', ?, NULL, ?)`,
+        [verId, id, JSON.stringify(snapshot), now]
+      );
+    }
+  }
+
+  // Seed system starter templates if none exist
+  const tplCount = await db.queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM home_section_templates');
+  if (!tplCount || Number(tplCount.cnt) === 0) {
+    for (const tmpl of STARTER_TEMPLATES) {
+      await db.execute(
+        `INSERT INTO home_section_templates (id, name_json, description_json, section_type, content_json, style_json, is_system, created_by_user_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, NULL, ?)`,
+        [
+          tmpl.id,
+          JSON.stringify(tmpl.name),
+          JSON.stringify(tmpl.description),
+          tmpl.sectionType,
+          JSON.stringify(tmpl.content),
+          JSON.stringify({ surface: 'graphite', padding: 'standard' }),
+          now,
+        ]
+      );
+    }
+  }
+
+  // Seed initial page-level published snapshot if none exists
+  const snapCount = await db.queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM home_page_snapshots');
+  if (!snapCount || Number(snapCount.cnt) === 0) {
+    const allSecs = await db.query<Record<string, unknown>>('SELECT * FROM home_sections ORDER BY sort_order ASC');
+    await db.execute(
+      `INSERT INTO home_page_snapshots (id, version, status, change_note, sections_snapshot_json, chrome_snapshot_json, published_at, created_by_user_id, created_at)
+       VALUES (?, 1, 'published', 'Initial page snapshot', ?, ?, ?, NULL, ?)`,
+      [
+        `hps-${crypto.randomUUID()}`,
+        JSON.stringify(allSecs),
+        JSON.stringify(DEFAULT_SITE_CHROME),
+        now,
+        now,
+      ]
     );
   }
 }
@@ -294,6 +454,14 @@ export async function ensureEssentialSeed(db: DbClient): Promise<{ firstRunSetup
       },
       whishAccountNumber: '',
       cardEnabled: false,
+    },
+    site_chrome_draft: DEFAULT_SITE_CHROME,
+    site_chrome_published: DEFAULT_SITE_CHROME,
+    home_migration_report: {
+      ranAt: new Date().toISOString(),
+      migratedSections: [],
+      migratedVersionsCount: 0,
+      alreadyUpToDateCount: 0,
     },
   };
 

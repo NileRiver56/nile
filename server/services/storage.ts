@@ -185,6 +185,10 @@ export async function saveUploadedMedia(
     entityType: UploadEntityType;
     entityId?: string;
     ownerUserId: string;
+    folder?: string;
+    alt?: { en: string; ar: string } | null;
+    focalX?: number;
+    focalY?: number;
   }
 ): Promise<StoredFileMeta> {
   const stripped = input.base64Data.replace(/^data:[^;]+;base64,/, '').trim();
@@ -199,13 +203,19 @@ export async function saveUploadedMedia(
   });
 
   const mediaId = `med-${crypto.randomUUID()}`;
+  const folder = (input.folder || input.entityType || 'general').replace(/[^a-z0-9_-]/gi, '').slice(0, 60) || 'general';
+  const focalX = Math.max(0, Math.min(100, Math.round(input.focalX ?? 50)));
+  const focalY = Math.max(0, Math.min(100, Math.round(input.focalY ?? 50)));
+
   await db.execute(
-    'INSERT INTO media (id, owner_user_id, entity_type, entity_id, storage_driver, storage_key, public_url, mime_type, size_bytes, width, height, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    `INSERT INTO media (id, owner_user_id, entity_type, entity_id, folder, storage_driver, storage_key, public_url, mime_type, size_bytes, width, height, alt_json, focal_x, focal_y, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       mediaId,
       input.ownerUserId,
       input.entityType,
       input.entityId || null,
+      folder,
       saved.storageDriver,
       saved.storageKey,
       saved.publicUrl,
@@ -213,6 +223,9 @@ export async function saveUploadedMedia(
       saved.sizeBytes,
       saved.width,
       saved.height,
+      input.alt ? JSON.stringify(input.alt) : null,
+      focalX,
+      focalY,
       toSqlTimestamp(),
     ]
   );

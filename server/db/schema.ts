@@ -249,6 +249,7 @@ export const media = mysqlTable('media', {
   ownerUserId: varchar('owner_user_id', { length: 64 }).notNull(),
   entityType: varchar('entity_type', { length: 40 }).notNull(),
   entityId: varchar('entity_id', { length: 64 }),
+  folder: varchar('folder', { length: 64 }).notNull().default('general'),
   storageDriver: varchar('storage_driver', { length: 24 }).notNull().default('local'),
   storageKey: varchar('storage_key', { length: 255 }).notNull(),
   publicUrl: varchar('public_url', { length: 255 }).notNull(),
@@ -256,6 +257,9 @@ export const media = mysqlTable('media', {
   sizeBytes: int('size_bytes').notNull(),
   width: int('width'),
   height: int('height'),
+  altJson: json('alt_json').$type<{ en: string; ar: string } | null>(),
+  focalX: int('focal_x').notNull().default(50),
+  focalY: int('focal_y').notNull().default(50),
   createdAt: timestamp('created_at').notNull().defaultNow(),
 });
 
@@ -457,13 +461,85 @@ export const banners = mysqlTable('banners', {
   bgToken: varchar('bg_token', { length: 32 }).notNull().default('graphite'),
   targetUrl: varchar('target_url', { length: 255 }).notNull(),
   pagesJson: json('pages_json').$type<string[]>().notNull(),
+  placement: varchar('placement', { length: 32 }).notNull().default('page_strip'),
+  imageUrl: varchar('image_url', { length: 500 }),
+  dismissible: boolean('dismissible').notNull().default(true),
+  audience: varchar('audience', { length: 32 }).notNull().default('all'),
+  deviceTarget: varchar('device_target', { length: 24 }).notNull().default('all'),
+  categorySlug: varchar('category_slug', { length: 120 }),
   priority: int('priority').notNull().default(0),
   impressions: int('impressions').notNull().default(0),
   clicks: int('clicks').notNull().default(0),
+  botFilteredCount: int('bot_filtered_count').notNull().default(0),
   startsAt: timestamp('starts_at'),
   endsAt: timestamp('ends_at'),
   active: boolean('active').notNull().default(true),
 });
+
+export const marketingPopups = mysqlTable('marketing_popups', {
+  id: varchar('id', { length: 64 }).primaryKey(),
+  titleJson: json('title_json').$type<{ en: string; ar: string }>().notNull(),
+  bodyJson: json('body_json').$type<{ en: string; ar: string }>().notNull(),
+  ctaLabelJson: json('cta_label_json').$type<{ en: string; ar: string }>().notNull(),
+  targetUrl: varchar('target_url', { length: 255 }).notNull().default('/catalog'),
+  imageUrl: varchar('image_url', { length: 500 }),
+  bgToken: varchar('bg_token', { length: 32 }).notNull().default('ember'),
+  popupType: varchar('popup_type', { length: 32 }).notNull().default('promo'),
+  triggerType: varchar('trigger_type', { length: 32 }).notNull().default('delay_seconds'),
+  triggerValue: int('trigger_value').notNull().default(5),
+  frequencyCap: varchar('frequency_cap', { length: 32 }).notNull().default('once_per_day'),
+  pagesJson: json('pages_json').$type<string[]>().notNull(),
+  audience: varchar('audience', { length: 32 }).notNull().default('all'),
+  deviceTarget: varchar('device_target', { length: 24 }).notNull().default('all'),
+  showNewsletterForm: boolean('show_newsletter_form').notNull().default(false),
+  couponCode: varchar('coupon_code', { length: 64 }),
+  startsAt: timestamp('starts_at'),
+  endsAt: timestamp('ends_at'),
+  active: boolean('active').notNull().default(true),
+  impressions: int('impressions').notNull().default(0),
+  conversions: int('conversions').notNull().default(0),
+  dismissals: int('dismissals').notNull().default(0),
+  botFilteredCount: int('bot_filtered_count').notNull().default(0),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+});
+
+export const featuredPlacements = mysqlTable('featured_placements', {
+  id: varchar('id', { length: 64 }).primaryKey(),
+  slotKey: varchar('slot_key', { length: 64 }).notNull(),
+  targetType: varchar('target_type', { length: 24 }).notNull(),
+  targetId: varchar('target_id', { length: 64 }).notNull(),
+  sellerId: varchar('seller_id', { length: 64 }).notNull(),
+  badgeJson: json('badge_json').$type<{ en: string; ar: string }>().notNull(),
+  priority: int('priority').notNull().default(10),
+  feeUsdCents: int('fee_usd_cents').notNull().default(0),
+  ledgerCharged: boolean('ledger_charged').notNull().default(false),
+  ledgerEntryId: varchar('ledger_entry_id', { length: 64 }),
+  startsAt: timestamp('starts_at'),
+  endsAt: timestamp('ends_at'),
+  active: boolean('active').notNull().default(true),
+  impressions: int('impressions').notNull().default(0),
+  clicks: int('clicks').notNull().default(0),
+  botFilteredCount: int('bot_filtered_count').notNull().default(0),
+  createdByUserId: varchar('created_by_user_id', { length: 64 }),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+});
+
+export const marketingEventsDedup = mysqlTable(
+  'marketing_events_dedup',
+  {
+    id: varchar('id', { length: 64 }).primaryKey(),
+    entityKind: varchar('entity_kind', { length: 24 }).notNull(),
+    entityId: varchar('entity_id', { length: 64 }).notNull(),
+    eventType: varchar('event_type', { length: 24 }).notNull(),
+    visitorHash: varchar('visitor_hash', { length: 64 }).notNull(),
+    bucketKey: varchar('bucket_key', { length: 32 }).notNull(),
+    createdAt: timestamp('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('uq_mkt_event_dedup').on(t.entityKind, t.entityId, t.eventType, t.visitorHash, t.bucketKey),
+  ]
+);
+
 
 export const homeSections = mysqlTable('home_sections', {
   id: varchar('id', { length: 64 }).primaryKey(),
@@ -472,10 +548,15 @@ export const homeSections = mysqlTable('home_sections', {
   contentJson: json('content_json').$type<Record<string, unknown>>().notNull(),
   sortOrder: int('sort_order').notNull().default(0),
   status: varchar('status', { length: 24 }).notNull().default('draft'),
+  visible: boolean('visible').notNull().default(true),
   audience: varchar('audience', { length: 32 }).notNull().default('all'),
+  targetingJson: json('targeting_json').$type<Record<string, unknown> | null>(),
+  styleJson: json('style_json').$type<Record<string, unknown> | null>(),
+  schedulePriority: int('schedule_priority').notNull().default(0),
   startsAt: timestamp('starts_at'),
   endsAt: timestamp('ends_at'),
   version: int('version').notNull().default(1),
+  updatedByUserId: varchar('updated_by_user_id', { length: 64 }),
   updatedAt: timestamp('updated_at').notNull().defaultNow(),
 });
 
@@ -483,10 +564,51 @@ export const homeSectionVersions = mysqlTable('home_section_versions', {
   id: varchar('id', { length: 64 }).primaryKey(),
   sectionId: varchar('section_id', { length: 64 }).notNull(),
   version: int('version').notNull(),
+  changeNote: varchar('change_note', { length: 255 }),
   snapshotJson: json('snapshot_json').$type<Record<string, unknown>>().notNull(),
   editedByUserId: varchar('edited_by_user_id', { length: 64 }),
   createdAt: timestamp('created_at').notNull().defaultNow(),
 });
+
+export const homeSectionTemplates = mysqlTable('home_section_templates', {
+  id: varchar('id', { length: 64 }).primaryKey(),
+  nameJson: json('name_json').$type<{ en: string; ar: string }>().notNull(),
+  descriptionJson: json('description_json').$type<{ en: string; ar: string }>().notNull(),
+  sectionType: varchar('section_type', { length: 40 }).notNull(),
+  contentJson: json('content_json').$type<Record<string, unknown>>().notNull(),
+  styleJson: json('style_json').$type<Record<string, unknown> | null>(),
+  isSystem: boolean('is_system').notNull().default(false),
+  createdByUserId: varchar('created_by_user_id', { length: 64 }),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+});
+
+export const homePageSnapshots = mysqlTable('home_page_snapshots', {
+  id: varchar('id', { length: 64 }).primaryKey(),
+  version: int('version').notNull(),
+  status: varchar('status', { length: 24 }).notNull().default('published'),
+  changeNote: varchar('change_note', { length: 255 }),
+  sectionsSnapshotJson: json('sections_snapshot_json').$type<Array<Record<string, unknown>>>().notNull(),
+  chromeSnapshotJson: json('chrome_snapshot_json').$type<Record<string, unknown>>().notNull(),
+  scheduledPublishAt: timestamp('scheduled_publish_at'),
+  publishedAt: timestamp('published_at'),
+  createdByUserId: varchar('created_by_user_id', { length: 64 }),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+});
+
+export const newsletterSubscribers = mysqlTable(
+  'newsletter_subscribers',
+  {
+    id: varchar('id', { length: 64 }).primaryKey(),
+    email: varchar('email', { length: 190 }).notNull(),
+    locale: varchar('locale', { length: 5 }).notNull().default('en'),
+    source: varchar('source', { length: 64 }).notNull().default('home'),
+    status: varchar('status', { length: 24 }).notNull().default('subscribed'),
+    unsubscribeToken: varchar('unsubscribe_token', { length: 96 }).notNull(),
+    consentedAt: timestamp('consented_at').notNull().defaultNow(),
+    createdAt: timestamp('created_at').notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex('uq_newsletter_email').on(t.email)]
+);
 
 export const pages = mysqlTable(
   'pages',

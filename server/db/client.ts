@@ -208,8 +208,10 @@ class SqlitePreviewClient implements DbClient {
       );
       CREATE TABLE IF NOT EXISTS media (
         id TEXT PRIMARY KEY, owner_user_id TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT,
+        folder TEXT NOT NULL DEFAULT 'general',
         storage_driver TEXT NOT NULL DEFAULT 'local', storage_key TEXT NOT NULL, public_url TEXT NOT NULL,
         mime_type TEXT NOT NULL, size_bytes INTEGER NOT NULL, width INTEGER, height INTEGER,
+        alt_json TEXT, focal_x INTEGER NOT NULL DEFAULT 50, focal_y INTEGER NOT NULL DEFAULT 50,
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
       CREATE TABLE IF NOT EXISTS stock_movements (
@@ -281,18 +283,63 @@ class SqlitePreviewClient implements DbClient {
       );
       CREATE TABLE IF NOT EXISTS banners (
         id TEXT PRIMARY KEY, title_json TEXT NOT NULL, bg_token TEXT NOT NULL DEFAULT 'graphite',
-        target_url TEXT NOT NULL, pages_json TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0,
+        target_url TEXT NOT NULL, pages_json TEXT NOT NULL, placement TEXT NOT NULL DEFAULT 'page_strip',
+        image_url TEXT, dismissible INTEGER NOT NULL DEFAULT 1, audience TEXT NOT NULL DEFAULT 'all',
+        device_target TEXT NOT NULL DEFAULT 'all', category_slug TEXT,
+        priority INTEGER NOT NULL DEFAULT 0, impressions INTEGER NOT NULL DEFAULT 0, clicks INTEGER NOT NULL DEFAULT 0,
+        bot_filtered_count INTEGER NOT NULL DEFAULT 0, starts_at TEXT, ends_at TEXT, active INTEGER NOT NULL DEFAULT 1
+      );
+      CREATE TABLE IF NOT EXISTS marketing_popups (
+        id TEXT PRIMARY KEY, title_json TEXT NOT NULL, body_json TEXT NOT NULL, cta_label_json TEXT NOT NULL,
+        target_url TEXT NOT NULL DEFAULT '/catalog', image_url TEXT, bg_token TEXT NOT NULL DEFAULT 'ember',
+        popup_type TEXT NOT NULL DEFAULT 'promo', trigger_type TEXT NOT NULL DEFAULT 'delay_seconds',
+        trigger_value INTEGER NOT NULL DEFAULT 5, frequency_cap TEXT NOT NULL DEFAULT 'once_per_day',
+        pages_json TEXT NOT NULL, audience TEXT NOT NULL DEFAULT 'all', device_target TEXT NOT NULL DEFAULT 'all',
+        show_newsletter_form INTEGER NOT NULL DEFAULT 0, coupon_code TEXT, starts_at TEXT, ends_at TEXT,
+        active INTEGER NOT NULL DEFAULT 1, impressions INTEGER NOT NULL DEFAULT 0, conversions INTEGER NOT NULL DEFAULT 0,
+        dismissals INTEGER NOT NULL DEFAULT 0, bot_filtered_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS featured_placements (
+        id TEXT PRIMARY KEY, slot_key TEXT NOT NULL, target_type TEXT NOT NULL, target_id TEXT NOT NULL,
+        seller_id TEXT NOT NULL, badge_json TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 10,
+        fee_usd_cents INTEGER NOT NULL DEFAULT 0, ledger_charged INTEGER NOT NULL DEFAULT 0,
+        ledger_entry_id TEXT, starts_at TEXT, ends_at TEXT, active INTEGER NOT NULL DEFAULT 1,
         impressions INTEGER NOT NULL DEFAULT 0, clicks INTEGER NOT NULL DEFAULT 0,
-        starts_at TEXT, ends_at TEXT, active INTEGER NOT NULL DEFAULT 1
+        bot_filtered_count INTEGER NOT NULL DEFAULT 0, created_by_user_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS marketing_events_dedup (
+        id TEXT PRIMARY KEY, entity_kind TEXT NOT NULL, entity_id TEXT NOT NULL, event_type TEXT NOT NULL,
+        visitor_hash TEXT NOT NULL, bucket_key TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(entity_kind, entity_id, event_type, visitor_hash, bucket_key)
       );
       CREATE TABLE IF NOT EXISTS home_sections (
         id TEXT PRIMARY KEY, section_type TEXT NOT NULL, title_json TEXT NOT NULL, content_json TEXT NOT NULL,
-        sort_order INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'draft', audience TEXT NOT NULL DEFAULT 'all',
-        starts_at TEXT, ends_at TEXT, version INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        sort_order INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'draft', visible INTEGER NOT NULL DEFAULT 1,
+        audience TEXT NOT NULL DEFAULT 'all', targeting_json TEXT, style_json TEXT,
+        schedule_priority INTEGER NOT NULL DEFAULT 0, starts_at TEXT, ends_at TEXT, version INTEGER NOT NULL DEFAULT 1,
+        updated_by_user_id TEXT, updated_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
       CREATE TABLE IF NOT EXISTS home_section_versions (
-        id TEXT PRIMARY KEY, section_id TEXT NOT NULL, version INTEGER NOT NULL, snapshot_json TEXT NOT NULL,
-        edited_by_user_id TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        id TEXT PRIMARY KEY, section_id TEXT NOT NULL, version INTEGER NOT NULL, change_note TEXT,
+        snapshot_json TEXT NOT NULL, edited_by_user_id TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS home_section_templates (
+        id TEXT PRIMARY KEY, name_json TEXT NOT NULL, description_json TEXT NOT NULL,
+        section_type TEXT NOT NULL, content_json TEXT NOT NULL, style_json TEXT,
+        is_system INTEGER NOT NULL DEFAULT 0, created_by_user_id TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS home_page_snapshots (
+        id TEXT PRIMARY KEY, version INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'published',
+        change_note TEXT, sections_snapshot_json TEXT NOT NULL, chrome_snapshot_json TEXT NOT NULL,
+        scheduled_publish_at TEXT, published_at TEXT, created_by_user_id TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS newsletter_subscribers (
+        id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, locale TEXT NOT NULL DEFAULT 'en',
+        source TEXT NOT NULL DEFAULT 'home', status TEXT NOT NULL DEFAULT 'subscribed',
+        unsubscribe_token TEXT NOT NULL, consented_at TEXT NOT NULL DEFAULT (datetime('now')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
       CREATE TABLE IF NOT EXISTS pages (
         id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, title_json TEXT NOT NULL, body_json TEXT NOT NULL,
@@ -358,6 +405,30 @@ class SqlitePreviewClient implements DbClient {
         id TEXT PRIMARY KEY, route TEXT NOT NULL, message TEXT NOT NULL, stack TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
     `);
+
+    const ensureCol = (table: string, col: string, defSql: string) => {
+      const cols = sqlite.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+      if (!cols.some((c) => c.name === col)) {
+        sqlite.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${defSql}`);
+      }
+    };
+    ensureCol('media', 'folder', "TEXT NOT NULL DEFAULT 'general'");
+    ensureCol('media', 'alt_json', 'TEXT');
+    ensureCol('media', 'focal_x', 'INTEGER NOT NULL DEFAULT 50');
+    ensureCol('media', 'focal_y', 'INTEGER NOT NULL DEFAULT 50');
+    ensureCol('home_sections', 'visible', 'INTEGER NOT NULL DEFAULT 1');
+    ensureCol('home_sections', 'targeting_json', 'TEXT');
+    ensureCol('home_sections', 'style_json', 'TEXT');
+    ensureCol('home_sections', 'schedule_priority', 'INTEGER NOT NULL DEFAULT 0');
+    ensureCol('home_sections', 'updated_by_user_id', 'TEXT');
+    ensureCol('home_section_versions', 'change_note', 'TEXT');
+    ensureCol('banners', 'placement', "TEXT NOT NULL DEFAULT 'page_strip'");
+    ensureCol('banners', 'image_url', 'TEXT');
+    ensureCol('banners', 'dismissible', 'INTEGER NOT NULL DEFAULT 1');
+    ensureCol('banners', 'audience', "TEXT NOT NULL DEFAULT 'all'");
+    ensureCol('banners', 'device_target', "TEXT NOT NULL DEFAULT 'all'");
+    ensureCol('banners', 'category_slug', 'TEXT');
+    ensureCol('banners', 'bot_filtered_count', 'INTEGER NOT NULL DEFAULT 0');
   }
 
   private getDb() {

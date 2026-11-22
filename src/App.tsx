@@ -15,6 +15,7 @@ import { SellerDashboardPage } from './pages/SellerDashboardPage.tsx';
 import { AdminDashboardPage } from './pages/AdminDashboardPage.tsx';
 import { StyleguidePage } from './pages/StyleguidePage.tsx';
 import { LegalPage } from './pages/LegalPage.tsx';
+import { MarketingOverlayManager } from './components/MarketingOverlayManager.tsx';
 
 function ToastBanner() {
   const { toast } = useMarketplace();
@@ -74,6 +75,7 @@ export default function App() {
           <Footer />
           <MiniCartDrawer />
           <MobileBottomNav />
+          <MarketingOverlayManager />
           <ToastBanner />
         </div>
       </MarketplaceProvider>

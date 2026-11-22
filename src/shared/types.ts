@@ -210,7 +210,8 @@ export interface LedgerEntry {
     | 'HOLD_RELEASED'
     | 'PAYOUT_REQUEST'
     | 'PAYOUT_SETTLED'
-    | 'SUBSCRIPTION_FEE';
+    | 'SUBSCRIPTION_FEE'
+    | 'FEATURED_PLACEMENT_FEE';
   direction: 'credit' | 'debit';
   amountUsdCents: number;
   availability: 'pending' | 'available' | 'settled';
@@ -299,6 +300,26 @@ export interface NaturalSearchParsed {
 }
 
 export type HomeSectionType =
+  | 'hero'
+  | 'promo_strip'
+  | 'bento_grid'
+  | 'product_grid'
+  | 'product_carousel'
+  | 'category_tiles'
+  | 'department_spotlight'
+  | 'flash_sale_block'
+  | 'featured_stores'
+  | 'brand_bar'
+  | 'social_proof'
+  | 'newsletter_box'
+  | 'trust_cells'
+  | 'how_it_works'
+  | 'faq_accordion'
+  | 'rich_block'
+  | 'video_3d_embed'
+  | 'announcement_bar';
+
+export type LegacyHomeSectionType =
   | 'hero_split'
   | 'trust_strip'
   | 'departments_bento'
@@ -316,7 +337,19 @@ export type HomeSectionType =
   | 'custom_rich_editorial';
 
 export type HomeSectionStatus = 'draft' | 'published' | 'archived';
-export type HomeSectionAudience = 'all' | 'guest' | 'logged_in' | 'arabic' | 'english';
+export type HomeSectionAudience = 'all' | 'guest' | 'logged_in' | 'arabic' | 'english' | 'new_visitor' | 'returning';
+
+export interface HomeSectionTargeting {
+  visitor?: 'all' | 'guest' | 'logged_in' | 'new_visitor' | 'returning';
+  device?: 'all' | 'desktop' | 'mobile';
+  locale?: 'all' | 'en' | 'ar';
+  governorate?: string;
+}
+
+export interface HomeSectionStyle {
+  surface?: 'ink' | 'graphite';
+  padding?: 'compact' | 'standard' | 'spacious';
+}
 
 export interface HomeSection {
   id: string;
@@ -325,10 +358,15 @@ export interface HomeSection {
   content: Record<string, unknown>;
   sortOrder: number;
   status: HomeSectionStatus;
+  visible: boolean;
   audience: HomeSectionAudience;
+  targeting?: HomeSectionTargeting;
+  style?: HomeSectionStyle;
+  schedulePriority?: number;
   startsAt?: string | null;
   endsAt?: string | null;
   version: number;
+  updatedByUserId?: string | null;
   updatedAt: string;
 }
 
@@ -336,12 +374,16 @@ export interface HomeSectionVersion {
   id: string;
   sectionId: string;
   version: number;
+  changeNote?: string | null;
   snapshot: {
     sectionType: HomeSectionType;
     title: LocalizedText;
     content: Record<string, unknown>;
     status: HomeSectionStatus;
+    visible?: boolean;
     audience: HomeSectionAudience;
+    targeting?: HomeSectionTargeting;
+    style?: HomeSectionStyle;
     startsAt?: string | null;
     endsAt?: string | null;
   };
@@ -349,8 +391,99 @@ export interface HomeSectionVersion {
   createdAt: string;
 }
 
+export interface HomeSectionTemplate {
+  id: string;
+  name: LocalizedText;
+  description: LocalizedText;
+  sectionType: HomeSectionType;
+  content: Record<string, unknown>;
+  style?: HomeSectionStyle;
+  isSystem: boolean;
+  createdAt: string;
+}
+
+export interface SiteChromeLink {
+  id: string;
+  label: LocalizedText;
+  url: string;
+  visible: boolean;
+}
+
+export interface SiteChromeMegaMenuDept {
+  slug: string;
+  title: LocalizedText;
+  tagline: LocalizedText;
+  links: Array<{ label: LocalizedText; url: string }>;
+}
+
+export interface SiteChromeFooterCol {
+  id: string;
+  title: LocalizedText;
+  links: Array<{ label: LocalizedText; url: string }>;
+}
+
+export interface SiteChromeSettings {
+  headerLinks: SiteChromeLink[];
+  showMegaMenu: boolean;
+  megaMenuDepartments: SiteChromeMegaMenuDept[];
+  footerColumns: SiteChromeFooterCol[];
+  footerNote: LocalizedText;
+  paymentBadges: string[];
+  homeSeo: {
+    title: LocalizedText;
+    description: LocalizedText;
+    ogImageUrl: string;
+  };
+  updatedAt?: string;
+}
+
+export interface HomePageSnapshot {
+  id: string;
+  version: number;
+  status: 'draft' | 'published' | 'scheduled';
+  changeNote?: string | null;
+  scheduledPublishAt?: string | null;
+  publishedAt?: string | null;
+  createdByUserId?: string | null;
+  createdAt: string;
+  sectionCount: number;
+}
+
+export interface MediaAsset {
+  id: string;
+  ownerUserId: string;
+  entityType: string;
+  folder: string;
+  publicUrl: string;
+  mimeType: string;
+  sizeBytes: number;
+  width: number | null;
+  height: number | null;
+  alt: LocalizedText;
+  focalX: number;
+  focalY: number;
+  createdAt: string;
+  usedIn: Array<{ kind: 'home_section' | 'banner' | 'product' | 'store'; id: string; label: string }>;
+}
+
+export interface HomeMigrationReport {
+  ranAt: string;
+  migratedSections: Array<{
+    id: string;
+    fromType: string;
+    toType: HomeSectionType;
+    titleEn: string;
+    status: string;
+  }>;
+  migratedVersionsCount: number;
+  alreadyUpToDateCount: number;
+}
+
 export type BannerPageScope = 'home' | 'catalog' | 'checkout' | 'store';
 export type BannerBgToken = 'graphite' | 'ember' | 'cedar' | 'gold' | 'cyan' | 'sand';
+export type BannerPlacementType = 'top_bar' | 'page_strip' | 'category_header' | 'inline_card' | 'floating_strip';
+export type MarketingAudienceType = 'all' | 'guest' | 'logged_in' | 'arabic' | 'english';
+export type DeviceTargetType = 'all' | 'desktop' | 'mobile';
 
 export interface OfferBanner {
   id: string;
@@ -359,12 +492,80 @@ export interface OfferBanner {
   bgToken: BannerBgToken;
   targetUrl: string;
   pages: BannerPageScope[];
+  placement: BannerPlacementType;
+  imageUrl?: string | null;
+  dismissible: boolean;
+  audience: MarketingAudienceType;
+  deviceTarget: DeviceTargetType;
+  categorySlug?: string | null;
   priority: number;
   impressions: number;
   clicks: number;
+  botFilteredCount?: number;
   startsAt?: string | null;
   endsAt?: string | null;
   active: boolean;
+}
+
+export type PopupType = 'promo' | 'newsletter' | 'announcement' | 'exit_intent' | 'cart_reminder';
+export type PopupTrigger = 'delay_seconds' | 'scroll_percent' | 'exit_intent' | 'cart_abandon' | 'immediate';
+export type PopupFrequency = 'once_per_session' | 'once_per_day' | 'once_per_week' | 'once_ever';
+
+export interface MarketingPopup {
+  id: string;
+  title: LocalizedText;
+  body: LocalizedText;
+  ctaLabel: LocalizedText;
+  targetUrl: string;
+  imageUrl?: string | null;
+  bgToken: BannerBgToken;
+  popupType: PopupType;
+  triggerType: PopupTrigger;
+  triggerValue: number;
+  frequencyCap: PopupFrequency;
+  pages: BannerPageScope[];
+  audience: MarketingAudienceType;
+  deviceTarget: DeviceTargetType;
+  showNewsletterForm: boolean;
+  couponCode?: string | null;
+  startsAt?: string | null;
+  endsAt?: string | null;
+  active: boolean;
+  impressions: number;
+  conversions: number;
+  dismissals: number;
+  botFilteredCount?: number;
+}
+
+export type FeaturedSlotKey =
+  | 'home_hero_spotlight'
+  | 'home_trending_top'
+  | 'catalog_top_sponsored'
+  | 'category_top_spotlight'
+  | 'search_promoted';
+
+export type FeaturedPlacementTargetType = 'product' | 'store';
+
+export interface FeaturedPlacement {
+  id: string;
+  slotKey: FeaturedSlotKey;
+  targetType: FeaturedPlacementTargetType;
+  targetId: string;
+  sellerId: string;
+  targetLabel?: LocalizedText | null;
+  sellerName?: LocalizedText | null;
+  badgeText: LocalizedText;
+  priority: number;
+  feeUsdCents: number;
+  ledgerCharged: boolean;
+  ledgerEntryId?: string | null;
+  startsAt?: string | null;
+  endsAt?: string | null;
+  active: boolean;
+  impressions: number;
+  clicks: number;
+  botFilteredCount?: number;
+  createdAt: string;
 }
 
 export type OfferType = 'percent' | 'fixed_usd_cents' | 'flash_percent';
@@ -385,4 +586,5 @@ export interface Offer {
   endsAt?: string | null;
   active: boolean;
 }
+
 

@@ -4,6 +4,7 @@ import type { NaturalSearchParsed, Product } from '../shared/types.ts';
 import { useMarketplace } from '../context/MarketplaceContext.tsx';
 import { EmptyState, ProductCard, SectionHeading, SkeletonCell } from '../components/HairlineUI.tsx';
 import { OfferBannerStrip } from '../components/OfferBannerStrip.tsx';
+import { FeaturedPlacementStrip } from '../components/FeaturedPlacementStrip.tsx';
 
 export function CatalogPage() {
   const { route, locale, t, sellers, navigate } = useMarketplace();
@@ -64,7 +65,14 @@ export function CatalogPage() {
 
   return (
     <div className="max-w-[1440px] mx-auto px-4 md:px-8 py-8 space-y-6">
-      <OfferBannerStrip page="catalog" />
+      <OfferBannerStrip page="catalog" placement="page_strip" />
+      <OfferBannerStrip page="catalog" placement="category_header" categorySlug={department || undefined} />
+      <FeaturedPlacementStrip
+        slots={query.trim() ? ['search_promoted', 'catalog_top_sponsored'] : ['catalog_top_sponsored', 'category_top_spotlight']}
+        headingEn="Sponsored & Promoted"
+        headingAr="منتجات ومتاجر مميزة"
+      />
+      <OfferBannerStrip page="catalog" placement="inline_card" />
       <SectionHeading
         title={t.allProducts}
         subtitle={

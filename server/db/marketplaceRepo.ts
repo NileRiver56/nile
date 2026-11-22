@@ -3,17 +3,30 @@ import type {
   AuditLogEntry,
   BannerBgToken,
   BannerPageScope,
+  BannerPlacementType,
   Category,
   Coupon,
   DeliveryMode,
   DeliveryZone,
+  DeviceTargetType,
+  FeaturedPlacement,
+  FeaturedPlacementTargetType,
+  FeaturedSlotKey,
+  HomeMigrationReport,
+  HomePageSnapshot,
   HomeSection,
   HomeSectionAudience,
   HomeSectionStatus,
+  HomeSectionStyle,
+  HomeSectionTargeting,
+  HomeSectionTemplate,
   HomeSectionType,
   HomeSectionVersion,
   LedgerEntry,
   LocalizedText,
+  MarketingAudienceType,
+  MarketingPopup,
+  MediaAsset,
   Offer,
   OfferApprovalStatus,
   OfferBanner,
@@ -27,18 +40,28 @@ import type {
   PaymentStatus,
   PayoutRequest,
   PlatformSettings,
+  PopupFrequency,
+  PopupTrigger,
+  PopupType,
   Product,
   ProductSpec,
   ProductVariant,
   Review,
   Seller,
   SellerStatus,
+  SiteChromeSettings,
   StorefrontThemeId,
   SubOrder,
   SubOrderStatus,
   SubscriptionPlan,
   SubscriptionTier,
 } from '../../src/shared/types.ts';
+import {
+  DEFAULT_SITE_CHROME,
+  HOME_SECTION_PRESETS,
+  mapLegacySectionType,
+  normalizeTargeting,
+} from '../../src/shared/homeSections.ts';
 import { isWithinSchedule, resolveUnitOfferPrice } from '../../src/shared/offers.ts';
 import type { DbClient, DbTx } from './client.ts';
 import { getPaymentAdapter, isCardGatewayConfigured } from '../paymentAdapters.ts';
@@ -76,7 +99,15 @@ function normalizePhone(phone: string): string {
 }
 
 export class MarketplaceRepo {
+  private publishedChromeCache: { value: SiteChromeSettings; cachedAt: number } | null = null;
+  private publishedHomeSectionsCache: { value: HomeSection[]; cachedAt: number } | null = null;
+
   constructor(private readonly db: DbClient) {}
+
+  invalidateHomeCache() {
+    this.publishedChromeCache = null;
+    this.publishedHomeSectionsCache = null;
+  }
 
   private keyCol(): string {
     return this.db.driver === 'mysql' ? '`key`' : 'key';
@@ -742,7 +773,15 @@ export class MarketplaceRepo {
     }));
   }
 
-  async getBootstrapData(ctx?: { isLoggedIn?: boolean; locale?: 'en' | 'ar'; includeDrafts?: boolean }) {
+  async getBootstrapData(ctx?: {
+    isLoggedIn?: boolean;
+    isNewVisitor?: boolean;
+    locale?: 'en' | 'ar';
+    includeDrafts?: boolean;
+    asOf?: string | null;
+    audiencePreview?: string | null;
+    device?: 'desktop' | 'mobile';
+  }) {
     const [
       settings,
       paymentsConfig,
@@ -753,7 +792,10 @@ export class MarketplaceRepo {
       deliveryZones,
       homeSections,
       banners,
+      popups,
+      featuredPlacements,
       offers,
+      siteChrome,
     ] = await Promise.all([
       this.getPlatformSettings(),
       this.getPaymentConfig(),
@@ -764,7 +806,10 @@ export class MarketplaceRepo {
       this.getDeliveryZones(),
       this.getPublicHomeSections(ctx),
       this.getActiveBanners(),
+      this.getActivePopups(),
+      this.getActiveFeaturedPlacements(),
       this.getActiveOffers(),
+      this.getSiteChrome(Boolean(ctx?.includeDrafts)),
     ]);
 
     return {
@@ -777,7 +822,10 @@ export class MarketplaceRepo {
       deliveryZones,
       homeSections,
       banners,
+      popups,
+      featuredPlacements,
       offers,
+      siteChrome,
     };
   }
 
@@ -2213,9 +2261,11 @@ export class MarketplaceRepo {
         return sum + (plan?.monthlyFeeUsdCents || 0);
       }, 0);
 
-    const [homeBuilderData, bannersList, offersList] = await Promise.all([
+    const [homeBuilderData, bannersList, popupsList, featuredPlacementsList, offersList] = await Promise.all([
       this.adminListHomeSections(),
       this.adminListBanners(),
+      this.adminListPopups(),
+      this.adminListFeaturedPlacements(),
       this.adminListOffers(),
     ]);
 
@@ -2242,6 +2292,8 @@ export class MarketplaceRepo {
       homeSections: homeBuilderData.sections,
       homeSectionVersions: homeBuilderData.versionsBySectionId,
       banners: bannersList,
+      popups: popupsList,
+      featuredPlacements: featuredPlacementsList,
       offers: offersList,
       auditLog,
       staffUsers,
@@ -2482,43 +2534,106 @@ export class MarketplaceRepo {
     return this.getPageBySlug(slug);
   }
 
-  // --- Phase B: Home Sections Builder + Versioning/Rollback ---
+  // --- Home Builder v2: Sections, Page Snapshots, Templates, Chrome/SEO, Media Library ---
   private mapHomeSectionRow(row: Record<string, unknown>): HomeSection {
+    const legacyAudience = String(row.audience || 'all') as HomeSectionAudience;
+    const targeting = normalizeTargeting(
+      row.targeting_json ? parseJson<HomeSectionTargeting | null>(row.targeting_json, null) : null,
+      legacyAudience
+    );
+    const style = parseJson<HomeSectionStyle>(row.style_json, { surface: 'graphite', padding: 'standard' });
     return {
       id: String(row.id),
-      sectionType: String(row.section_type) as HomeSectionType,
+      sectionType: mapLegacySectionType(String(row.section_type)),
       title: parseJson<LocalizedText>(row.title_json, { en: '', ar: '' }),
       content: parseJson<Record<string, unknown>>(row.content_json, {}),
       sortOrder: Number(row.sort_order ?? 0),
       status: String(row.status || 'draft') as HomeSectionStatus,
-      audience: String(row.audience || 'all') as HomeSectionAudience,
+      visible: row.visible === undefined || row.visible === null ? true : Boolean(row.visible),
+      audience: legacyAudience,
+      targeting,
+      style,
+      schedulePriority: Number(row.schedule_priority ?? 0),
       startsAt: row.starts_at ? String(row.starts_at) : null,
       endsAt: row.ends_at ? String(row.ends_at) : null,
       version: Number(row.version ?? 1),
+      updatedByUserId: row.updated_by_user_id ? String(row.updated_by_user_id) : null,
       updatedAt: String(row.updated_at),
     };
   }
 
+  async getSiteChrome(draft = false): Promise<SiteChromeSettings> {
+    if (!draft && this.publishedChromeCache && Date.now() - this.publishedChromeCache.cachedAt < 60_000) {
+      return this.publishedChromeCache.value;
+    }
+    const key = draft ? 'site_chrome_draft' : 'site_chrome_published';
+    const row = await this.db.queryOne<{ value_json: string }>(
+      `SELECT value_json FROM settings WHERE ${this.keyCol()} = ?`,
+      [key]
+    );
+    const parsed = parseJson<SiteChromeSettings>(row?.value_json, DEFAULT_SITE_CHROME);
+    const merged: SiteChromeSettings = {
+      ...DEFAULT_SITE_CHROME,
+      ...parsed,
+      homeSeo: {
+        ...DEFAULT_SITE_CHROME.homeSeo,
+        ...(parsed.homeSeo || {}),
+      },
+    };
+    if (!draft) {
+      this.publishedChromeCache = { value: merged, cachedAt: Date.now() };
+    }
+    return merged;
+  }
+
   async getPublicHomeSections(ctx?: {
     isLoggedIn?: boolean;
+    isNewVisitor?: boolean;
     locale?: 'en' | 'ar';
     includeDrafts?: boolean;
+    asOf?: string | null;
+    audiencePreview?: string | null;
+    device?: 'desktop' | 'mobile';
   }): Promise<HomeSection[]> {
-    const rows = await this.db.query<Record<string, unknown>>(
-      'SELECT * FROM home_sections ORDER BY sort_order ASC, updated_at ASC'
-    );
-    const mapped = rows.map((r) => this.mapHomeSectionRow(r));
-    if (ctx?.includeDrafts) {
-      return mapped.filter((s) => s.status !== 'archived');
+    let allMapped: HomeSection[];
+    if (!ctx?.includeDrafts && !ctx?.asOf && this.publishedHomeSectionsCache && Date.now() - this.publishedHomeSectionsCache.cachedAt < 30_000) {
+      allMapped = this.publishedHomeSectionsCache.value;
+    } else {
+      const rows = await this.db.query<Record<string, unknown>>(
+        'SELECT * FROM home_sections ORDER BY sort_order ASC, schedule_priority DESC, updated_at ASC'
+      );
+      allMapped = rows.map((r) => this.mapHomeSectionRow(r));
+      if (!ctx?.includeDrafts && !ctx?.asOf) {
+        this.publishedHomeSectionsCache = { value: allMapped, cachedAt: Date.now() };
+      }
     }
-    const nowMs = Date.now();
-    return mapped.filter((s) => {
-      if (s.status !== 'published') return false;
-      if (!isWithinSchedule(s.startsAt, s.endsAt, nowMs)) return false;
-      if (s.audience === 'guest' && ctx?.isLoggedIn) return false;
-      if (s.audience === 'logged_in' && !ctx?.isLoggedIn) return false;
-      if (s.audience === 'arabic' && ctx?.locale && ctx.locale !== 'ar') return false;
-      if (s.audience === 'english' && ctx?.locale && ctx.locale !== 'en') return false;
+
+    const evalMs = ctx?.asOf ? (Date.parse(ctx.asOf) || Date.now()) : Date.now();
+    const visitorSim = ctx?.audiencePreview || (ctx?.isLoggedIn ? 'logged_in' : ctx?.isNewVisitor ? 'new_visitor' : 'guest');
+
+    return allMapped.filter((s) => {
+      if (s.status === 'archived') return false;
+      if (!ctx?.includeDrafts) {
+        if (!s.visible) return false;
+        if (s.status !== 'published') return false;
+      } else {
+        // In builder/admin draft preview, respect eye visibility if toggled off
+        if (!s.visible) return false;
+      }
+
+      if (!isWithinSchedule(s.startsAt, s.endsAt, evalMs)) return false;
+
+      const t = s.targeting || normalizeTargeting(null, s.audience);
+      if (t.locale && t.locale !== 'all' && ctx?.locale && t.locale !== ctx.locale) return false;
+      if (t.device && t.device !== 'all' && ctx?.device && t.device !== ctx.device) return false;
+
+      if (t.visitor && t.visitor !== 'all') {
+        if (ctx?.audiencePreview === 'all') return true;
+        if (t.visitor === 'guest' && visitorSim !== 'guest' && visitorSim !== 'new_visitor') return false;
+        if (t.visitor === 'logged_in' && visitorSim !== 'logged_in' && visitorSim !== 'returning') return false;
+        if (t.visitor === 'new_visitor' && visitorSim !== 'new_visitor' && visitorSim !== 'guest') return false;
+        if (t.visitor === 'returning' && visitorSim !== 'returning' && visitorSim !== 'logged_in') return false;
+      }
       return true;
     });
   }
@@ -2538,22 +2653,62 @@ export class MarketplaceRepo {
     for (const vr of versionRows) {
       const sid = String(vr.section_id);
       if (!versionsBySectionId[sid]) versionsBySectionId[sid] = [];
+      const snapRaw = parseJson<Record<string, unknown>>(vr.snapshot_json, {});
       versionsBySectionId[sid].push({
         id: String(vr.id),
         sectionId: sid,
         version: Number(vr.version),
-        snapshot: parseJson<HomeSectionVersion['snapshot']>(vr.snapshot_json, {
-          sectionType: 'custom_rich_editorial',
-          title: { en: '', ar: '' },
-          content: {},
-          status: 'draft',
-          audience: 'all',
-        }),
+        changeNote: vr.change_note ? String(vr.change_note) : null,
+        snapshot: {
+          sectionType: mapLegacySectionType(String(snapRaw.sectionType || 'rich_block')),
+          title: parseJson<LocalizedText>(snapRaw.title, { en: '', ar: '' }),
+          content: (snapRaw.content as Record<string, unknown>) || {},
+          status: (snapRaw.status as HomeSectionStatus) || 'draft',
+          visible: snapRaw.visible === undefined ? true : Boolean(snapRaw.visible),
+          audience: (snapRaw.audience as HomeSectionAudience) || 'all',
+          targeting: (snapRaw.targeting as HomeSectionTargeting) || undefined,
+          style: (snapRaw.style as HomeSectionStyle) || undefined,
+          startsAt: snapRaw.startsAt ? String(snapRaw.startsAt) : null,
+          endsAt: snapRaw.endsAt ? String(snapRaw.endsAt) : null,
+        },
         editedByUserId: vr.edited_by_user_id ? String(vr.edited_by_user_id) : null,
         createdAt: String(vr.created_at),
       });
     }
     return { sections, versionsBySectionId };
+  }
+
+  async adminGetHomeBuilderState() {
+    const [{ sections, versionsBySectionId }, chromeDraft, chromePublished, templates, pageSnapshots, mediaLibrary, migrationRow] =
+      await Promise.all([
+        this.adminListHomeSections(),
+        this.getSiteChrome(true),
+        this.getSiteChrome(false),
+        this.adminListSectionTemplates(),
+        this.adminListPageSnapshots(),
+        this.adminListMediaLibrary(),
+        this.db.queryOne<{ value_json: string }>(
+          `SELECT value_json FROM settings WHERE ${this.keyCol()} = 'home_migration_report'`
+        ),
+      ]);
+
+    const migrationReport = parseJson<HomeMigrationReport>(migrationRow?.value_json, {
+      ranAt: new Date().toISOString(),
+      migratedSections: [],
+      migratedVersionsCount: 0,
+      alreadyUpToDateCount: sections.length,
+    });
+
+    return {
+      sections,
+      versionsBySectionId,
+      chromeDraft,
+      chromePublished,
+      templates,
+      pageSnapshots,
+      mediaLibrary,
+      migrationReport,
+    };
   }
 
   async adminCreateHomeSection(
@@ -2563,23 +2718,44 @@ export class MarketplaceRepo {
       title: LocalizedText;
       content: Record<string, unknown>;
       status?: HomeSectionStatus;
+      visible?: boolean;
       audience?: HomeSectionAudience;
+      targeting?: HomeSectionTargeting;
+      style?: HomeSectionStyle;
+      schedulePriority?: number;
       startsAt?: string | null;
       endsAt?: string | null;
+      insertAtIndex?: number;
     },
     ipAddress?: string
   ): Promise<HomeSection> {
-    return this.db.transaction(async (tx) => {
-      const maxRow = await tx.queryOne<{ max_sort: number | null }>('SELECT MAX(sort_order) AS max_sort FROM home_sections');
-      const nextSort = Number(maxRow?.max_sort ?? 0) + 10;
+    const created = await this.db.transaction(async (tx) => {
+      const existingRows = await tx.query<{ id: string; sort_order: number }>(
+        'SELECT id, sort_order FROM home_sections ORDER BY sort_order ASC'
+      );
       const id = `hs-${crypto.randomUUID()}`;
       const status: HomeSectionStatus = input.status || 'draft';
+      const visible = input.visible !== false;
       const audience: HomeSectionAudience = input.audience || 'all';
+      const targeting = normalizeTargeting(input.targeting, audience);
+      const style: HomeSectionStyle = input.style || { surface: 'graphite', padding: 'standard' };
       const now = toSqlTimestamp();
 
+      let nextSort = (existingRows.length + 1) * 10;
+      if (input.insertAtIndex !== undefined && input.insertAtIndex >= 0 && input.insertAtIndex <= existingRows.length) {
+        const ordered = existingRows.map((r) => r.id);
+        ordered.splice(input.insertAtIndex, 0, id);
+        nextSort = (input.insertAtIndex + 1) * 10;
+        for (let i = 0; i < ordered.length; i++) {
+          if (ordered[i] !== id) {
+            await tx.execute('UPDATE home_sections SET sort_order = ? WHERE id = ?', [(i + 1) * 10, ordered[i]]);
+          }
+        }
+      }
+
       await tx.execute(
-        `INSERT INTO home_sections (id, section_type, title_json, content_json, sort_order, status, audience, starts_at, ends_at, version, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+        `INSERT INTO home_sections (id, section_type, title_json, content_json, sort_order, status, visible, audience, targeting_json, style_json, schedule_priority, starts_at, ends_at, version, updated_by_user_id, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
         [
           id,
           input.sectionType,
@@ -2587,16 +2763,21 @@ export class MarketplaceRepo {
           JSON.stringify(input.content || {}),
           nextSort,
           status,
+          visible ? 1 : 0,
           audience,
+          JSON.stringify(targeting),
+          JSON.stringify(style),
+          Math.trunc(input.schedulePriority ?? 0),
           input.startsAt ? toSqlTimestamp(new Date(input.startsAt)) : null,
           input.endsAt ? toSqlTimestamp(new Date(input.endsAt)) : null,
+          actorUserId,
           now,
         ]
       );
 
       await tx.execute(
-        `INSERT INTO home_section_versions (id, section_id, version, snapshot_json, edited_by_user_id, created_at)
-         VALUES (?, ?, 1, ?, ?, ?)`,
+        `INSERT INTO home_section_versions (id, section_id, version, change_note, snapshot_json, edited_by_user_id, created_at)
+         VALUES (?, ?, 1, 'Created block', ?, ?, ?)`,
         [
           `hsv-${crypto.randomUUID()}`,
           id,
@@ -2605,7 +2786,10 @@ export class MarketplaceRepo {
             title: input.title,
             content: input.content || {},
             status,
+            visible,
             audience,
+            targeting,
+            style,
             startsAt: input.startsAt || null,
             endsAt: input.endsAt || null,
           }),
@@ -2623,9 +2807,11 @@ export class MarketplaceRepo {
         ipAddress,
       });
 
-      const created = await tx.queryOne<Record<string, unknown>>('SELECT * FROM home_sections WHERE id = ?', [id]);
-      return this.mapHomeSectionRow(created!);
+      const row = await tx.queryOne<Record<string, unknown>>('SELECT * FROM home_sections WHERE id = ?', [id]);
+      return this.mapHomeSectionRow(row!);
     });
+    this.invalidateHomeCache();
+    return created;
   }
 
   async adminUpdateHomeSection(
@@ -2636,14 +2822,19 @@ export class MarketplaceRepo {
       title?: LocalizedText;
       content?: Record<string, unknown>;
       status?: HomeSectionStatus;
+      visible?: boolean;
       audience?: HomeSectionAudience;
+      targeting?: HomeSectionTargeting;
+      style?: HomeSectionStyle;
+      schedulePriority?: number;
       startsAt?: string | null;
       endsAt?: string | null;
       sortOrder?: number;
+      changeNote?: string;
     },
     ipAddress?: string
   ): Promise<HomeSection> {
-    return this.db.transaction(async (tx) => {
+    const updated = await this.db.transaction(async (tx) => {
       const existingRow = await tx.queryOne<Record<string, unknown>>('SELECT * FROM home_sections WHERE id = ?', [sectionId]);
       if (!existingRow) throw new Error('Home section not found.');
       const existing = this.mapHomeSectionRow(existingRow);
@@ -2652,7 +2843,12 @@ export class MarketplaceRepo {
       const nextTitle = patch.title || existing.title;
       const nextContent = patch.content !== undefined ? patch.content : existing.content;
       const nextStatus = patch.status || existing.status;
+      const nextVisible = patch.visible !== undefined ? patch.visible : existing.visible;
       const nextAudience = patch.audience || existing.audience;
+      const nextTargeting =
+        patch.targeting !== undefined ? normalizeTargeting(patch.targeting, nextAudience) : existing.targeting || normalizeTargeting(null, nextAudience);
+      const nextStyle = patch.style !== undefined ? patch.style : existing.style || { surface: 'graphite', padding: 'standard' };
+      const nextPriority = patch.schedulePriority !== undefined ? Math.trunc(patch.schedulePriority) : (existing.schedulePriority ?? 0);
       const nextStarts =
         patch.startsAt !== undefined
           ? patch.startsAt
@@ -2671,7 +2867,7 @@ export class MarketplaceRepo {
 
       await tx.execute(
         `UPDATE home_sections
-         SET section_type = ?, title_json = ?, content_json = ?, sort_order = ?, status = ?, audience = ?, starts_at = ?, ends_at = ?, version = ?, updated_at = ?
+         SET section_type = ?, title_json = ?, content_json = ?, sort_order = ?, status = ?, visible = ?, audience = ?, targeting_json = ?, style_json = ?, schedule_priority = ?, starts_at = ?, ends_at = ?, version = ?, updated_by_user_id = ?, updated_at = ?
          WHERE id = ?`,
         [
           nextType,
@@ -2679,28 +2875,37 @@ export class MarketplaceRepo {
           JSON.stringify(nextContent),
           nextSort,
           nextStatus,
+          nextVisible ? 1 : 0,
           nextAudience,
+          JSON.stringify(nextTargeting),
+          JSON.stringify(nextStyle),
+          nextPriority,
           nextStarts,
           nextEnds,
           nextVersion,
+          actorUserId,
           now,
           sectionId,
         ]
       );
 
       await tx.execute(
-        `INSERT INTO home_section_versions (id, section_id, version, snapshot_json, edited_by_user_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO home_section_versions (id, section_id, version, change_note, snapshot_json, edited_by_user_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
         [
           `hsv-${crypto.randomUUID()}`,
           sectionId,
           nextVersion,
+          patch.changeNote?.slice(0, 240) || 'Updated block settings',
           JSON.stringify({
             sectionType: nextType,
             title: nextTitle,
             content: nextContent,
             status: nextStatus,
+            visible: nextVisible,
             audience: nextAudience,
+            targeting: nextTargeting,
+            style: nextStyle,
             startsAt: nextStarts,
             endsAt: nextEnds,
           }),
@@ -2714,22 +2919,54 @@ export class MarketplaceRepo {
         action: 'admin.update_home_section',
         entityType: 'home_section',
         entityId: sectionId,
-        before: { version: existing.version, status: existing.status },
-        after: { version: nextVersion, status: nextStatus, audience: nextAudience },
+        before: { version: existing.version, status: existing.status, visible: existing.visible },
+        after: { version: nextVersion, status: nextStatus, visible: nextVisible, audience: nextAudience },
         ipAddress,
       });
 
-      const updated = await tx.queryOne<Record<string, unknown>>('SELECT * FROM home_sections WHERE id = ?', [sectionId]);
-      return this.mapHomeSectionRow(updated!);
+      const row = await tx.queryOne<Record<string, unknown>>('SELECT * FROM home_sections WHERE id = ?', [sectionId]);
+      return this.mapHomeSectionRow(row!);
     });
+    this.invalidateHomeCache();
+    return updated;
+  }
+
+  async adminDuplicateHomeSection(sectionId: string, actorUserId: string, ipAddress?: string): Promise<HomeSection> {
+    const existingRow = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM home_sections WHERE id = ?', [sectionId]);
+    if (!existingRow) throw new Error('Home section not found.');
+    const existing = this.mapHomeSectionRow(existingRow);
+
+    const allRows = await this.db.query<{ id: string }>('SELECT id FROM home_sections ORDER BY sort_order ASC');
+    const idx = allRows.findIndex((r) => r.id === sectionId);
+    const insertAt = idx >= 0 ? idx + 1 : allRows.length;
+
+    return this.adminCreateHomeSection(
+      actorUserId,
+      {
+        sectionType: existing.sectionType,
+        title: { en: `${existing.title.en} (Copy)`, ar: `${existing.title.ar} (نسخة)` },
+        content: existing.content,
+        status: 'draft',
+        visible: existing.visible,
+        audience: existing.audience,
+        targeting: existing.targeting,
+        style: existing.style,
+        schedulePriority: existing.schedulePriority,
+        startsAt: existing.startsAt,
+        endsAt: existing.endsAt,
+        insertAtIndex: insertAt,
+      },
+      ipAddress
+    );
   }
 
   async adminReorderHomeSections(orderedIds: string[], actorUserId: string, ipAddress?: string): Promise<HomeSection[]> {
-    return this.db.transaction(async (tx) => {
+    const list = await this.db.transaction(async (tx) => {
       const now = toSqlTimestamp();
       for (let i = 0; i < orderedIds.length; i++) {
-        await tx.execute('UPDATE home_sections SET sort_order = ?, updated_at = ? WHERE id = ?', [
+        await tx.execute('UPDATE home_sections SET sort_order = ?, updated_by_user_id = ?, updated_at = ? WHERE id = ?', [
           (i + 1) * 10,
+          actorUserId,
           now,
           orderedIds[i],
         ]);
@@ -2747,6 +2984,8 @@ export class MarketplaceRepo {
       );
       return rows.map((r) => this.mapHomeSectionRow(r));
     });
+    this.invalidateHomeCache();
+    return list;
   }
 
   async adminRollbackHomeSection(
@@ -2755,7 +2994,7 @@ export class MarketplaceRepo {
     actorUserId: string,
     ipAddress?: string
   ): Promise<HomeSection> {
-    return this.db.transaction(async (tx) => {
+    const restored = await this.db.transaction(async (tx) => {
       const currentRow = await tx.queryOne<Record<string, unknown>>('SELECT * FROM home_sections WHERE id = ?', [sectionId]);
       if (!currentRow) throw new Error('Home section not found.');
       const current = this.mapHomeSectionRow(currentRow);
@@ -2765,39 +3004,66 @@ export class MarketplaceRepo {
         [versionId, sectionId]
       );
       if (!verRow) throw new Error('Version snapshot not found.');
-      const snap = parseJson<HomeSectionVersion['snapshot']>(verRow.snapshot_json, {
-        sectionType: current.sectionType,
-        title: current.title,
-        content: current.content,
-        status: current.status,
-        audience: current.audience,
-      });
+      const snapRaw = parseJson<Record<string, unknown>>(verRow.snapshot_json, {});
+      const snapType = mapLegacySectionType(String(snapRaw.sectionType || current.sectionType));
+      const snapTitle = parseJson<LocalizedText>(snapRaw.title, current.title);
+      const snapContent = (snapRaw.content as Record<string, unknown>) || current.content;
+      const snapStatus = (snapRaw.status as HomeSectionStatus) || current.status;
+      const snapVisible = snapRaw.visible === undefined ? true : Boolean(snapRaw.visible);
+      const snapAudience = (snapRaw.audience as HomeSectionAudience) || current.audience;
+      const snapTargeting = normalizeTargeting(snapRaw.targeting, snapAudience);
+      const snapStyle = (snapRaw.style as HomeSectionStyle) || current.style || { surface: 'graphite', padding: 'standard' };
+      const snapStarts = snapRaw.startsAt ? String(snapRaw.startsAt) : null;
+      const snapEnds = snapRaw.endsAt ? String(snapRaw.endsAt) : null;
 
       const nextVersion = current.version + 1;
       const now = toSqlTimestamp();
 
       await tx.execute(
         `UPDATE home_sections
-         SET section_type = ?, title_json = ?, content_json = ?, status = ?, audience = ?, starts_at = ?, ends_at = ?, version = ?, updated_at = ?
+         SET section_type = ?, title_json = ?, content_json = ?, status = ?, visible = ?, audience = ?, targeting_json = ?, style_json = ?, starts_at = ?, ends_at = ?, version = ?, updated_by_user_id = ?, updated_at = ?
          WHERE id = ?`,
         [
-          snap.sectionType,
-          JSON.stringify(snap.title),
-          JSON.stringify(snap.content),
-          snap.status,
-          snap.audience,
-          snap.startsAt || null,
-          snap.endsAt || null,
+          snapType,
+          JSON.stringify(snapTitle),
+          JSON.stringify(snapContent),
+          snapStatus,
+          snapVisible ? 1 : 0,
+          snapAudience,
+          JSON.stringify(snapTargeting),
+          JSON.stringify(snapStyle),
+          snapStarts,
+          snapEnds,
           nextVersion,
+          actorUserId,
           now,
           sectionId,
         ]
       );
 
       await tx.execute(
-        `INSERT INTO home_section_versions (id, section_id, version, snapshot_json, edited_by_user_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [`hsv-${crypto.randomUUID()}`, sectionId, nextVersion, JSON.stringify(snap), actorUserId, now]
+        `INSERT INTO home_section_versions (id, section_id, version, change_note, snapshot_json, edited_by_user_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          `hsv-${crypto.randomUUID()}`,
+          sectionId,
+          nextVersion,
+          `Rolled back to v${Number(verRow.version)}`,
+          JSON.stringify({
+            sectionType: snapType,
+            title: snapTitle,
+            content: snapContent,
+            status: snapStatus,
+            visible: snapVisible,
+            audience: snapAudience,
+            targeting: snapTargeting,
+            style: snapStyle,
+            startsAt: snapStarts,
+            endsAt: snapEnds,
+          }),
+          actorUserId,
+          now,
+        ]
       );
 
       await writeAuditLog(tx, {
@@ -2813,6 +3079,8 @@ export class MarketplaceRepo {
       const updated = await tx.queryOne<Record<string, unknown>>('SELECT * FROM home_sections WHERE id = ?', [sectionId]);
       return this.mapHomeSectionRow(updated!);
     });
+    this.invalidateHomeCache();
+    return restored;
   }
 
   async adminDeleteHomeSection(sectionId: string, actorUserId: string, ipAddress?: string): Promise<void> {
@@ -2827,9 +3095,436 @@ export class MarketplaceRepo {
         ipAddress,
       });
     });
+    this.invalidateHomeCache();
   }
 
-  // --- Phase B: Small Offer Banners Engine ---
+  async adminListPageSnapshots(): Promise<HomePageSnapshot[]> {
+    const rows = await this.db.query<Record<string, unknown>>(
+      'SELECT * FROM home_page_snapshots ORDER BY version DESC, created_at DESC LIMIT 30'
+    );
+    return rows.map((r) => {
+      const secs = parseJson<Array<Record<string, unknown>>>(r.sections_snapshot_json, []);
+      return {
+        id: String(r.id),
+        version: Number(r.version),
+        status: String(r.status || 'published') as HomePageSnapshot['status'],
+        changeNote: r.change_note ? String(r.change_note) : null,
+        scheduledPublishAt: r.scheduled_publish_at ? String(r.scheduled_publish_at) : null,
+        publishedAt: r.published_at ? String(r.published_at) : null,
+        createdByUserId: r.created_by_user_id ? String(r.created_by_user_id) : null,
+        createdAt: String(r.created_at),
+        sectionCount: secs.length,
+      };
+    });
+  }
+
+  async adminPublishHomePage(
+    actorUserId: string,
+    input: { changeNote?: string; scheduledPublishAt?: string | null },
+    ipAddress?: string
+  ): Promise<HomePageSnapshot> {
+    const snap = await this.db.transaction(async (tx) => {
+      const now = toSqlTimestamp();
+      const maxVerRow = await tx.queryOne<{ max_v: number | null }>('SELECT MAX(version) AS max_v FROM home_page_snapshots');
+      const nextVersion = Number(maxVerRow?.max_v ?? 0) + 1;
+      const isScheduled = Boolean(input.scheduledPublishAt && Date.parse(input.scheduledPublishAt) > Date.now());
+
+      if (!isScheduled) {
+        // Promote non-archived draft sections to published
+        await tx.execute(
+          "UPDATE home_sections SET status = 'published', updated_by_user_id = ?, updated_at = ? WHERE status = 'draft'",
+          [actorUserId, now]
+        );
+        // Copy draft chrome -> published chrome
+        const kCol = this.keyCol();
+        const draftChromeRow = await tx.queryOne<{ value_json: string }>(
+          `SELECT value_json FROM settings WHERE ${kCol} = 'site_chrome_draft'`
+        );
+        if (draftChromeRow) {
+          await tx.execute(
+            this.db.driver === 'mysql'
+              ? `INSERT INTO settings (${kCol}, value_json, updated_at) VALUES ('site_chrome_published', ?, ?) ON DUPLICATE KEY UPDATE value_json = VALUES(value_json), updated_at = VALUES(updated_at)`
+              : `INSERT INTO settings (${kCol}, value_json, updated_at) VALUES ('site_chrome_published', ?, ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
+            [typeof draftChromeRow.value_json === 'string' ? draftChromeRow.value_json : JSON.stringify(draftChromeRow.value_json), now]
+          );
+        }
+      }
+
+      const sectionRows = await tx.query<Record<string, unknown>>(
+        'SELECT * FROM home_sections WHERE status != ? ORDER BY sort_order ASC',
+        ['archived']
+      );
+      const chrome = await this.getSiteChrome(true);
+      const id = `hps-${crypto.randomUUID()}`;
+      const status = isScheduled ? 'scheduled' : 'published';
+      const schedSql = isScheduled && input.scheduledPublishAt ? toSqlTimestamp(new Date(input.scheduledPublishAt)) : null;
+
+      await tx.execute(
+        `INSERT INTO home_page_snapshots (id, version, status, change_note, sections_snapshot_json, chrome_snapshot_json, scheduled_publish_at, published_at, created_by_user_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          id,
+          nextVersion,
+          status,
+          input.changeNote?.trim() || (isScheduled ? 'Scheduled publish' : 'Published Home & Chrome'),
+          JSON.stringify(sectionRows),
+          JSON.stringify(chrome),
+          schedSql,
+          isScheduled ? null : now,
+          actorUserId,
+          now,
+        ]
+      );
+
+      await writeAuditLog(tx, {
+        actorUserId,
+        action: isScheduled ? 'admin.schedule_home_page' : 'admin.publish_home_page',
+        entityType: 'home_page',
+        entityId: id,
+        after: { version: nextVersion, status, sectionCount: sectionRows.length },
+        ipAddress,
+      });
+
+      return {
+        id,
+        version: nextVersion,
+        status: status as HomePageSnapshot['status'],
+        changeNote: input.changeNote?.trim() || null,
+        scheduledPublishAt: schedSql,
+        publishedAt: isScheduled ? null : now,
+        createdByUserId: actorUserId,
+        createdAt: now,
+        sectionCount: sectionRows.length,
+      };
+    });
+
+    this.invalidateHomeCache();
+    return snap;
+  }
+
+  async adminRollbackHomePage(snapshotId: string, actorUserId: string, ipAddress?: string): Promise<HomePageSnapshot> {
+    const result = await this.db.transaction(async (tx) => {
+      const target = await tx.queryOne<Record<string, unknown>>('SELECT * FROM home_page_snapshots WHERE id = ?', [snapshotId]);
+      if (!target) throw new Error('Home page snapshot not found.');
+
+      const sectionsArr = parseJson<Array<Record<string, unknown>>>(target.sections_snapshot_json, []);
+      const chromeObj = parseJson<SiteChromeSettings>(target.chrome_snapshot_json, DEFAULT_SITE_CHROME);
+      const now = toSqlTimestamp();
+
+      await tx.execute('DELETE FROM home_sections');
+      for (let i = 0; i < sectionsArr.length; i++) {
+        const sr = sectionsArr[i];
+        const sid = String(sr.id || `hs-${crypto.randomUUID()}`);
+        await tx.execute(
+          `INSERT INTO home_sections (id, section_type, title_json, content_json, sort_order, status, visible, audience, targeting_json, style_json, schedule_priority, starts_at, ends_at, version, updated_by_user_id, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            sid,
+            mapLegacySectionType(String(sr.section_type || 'rich_block')),
+            typeof sr.title_json === 'string' ? sr.title_json : JSON.stringify(sr.title_json || { en: '', ar: '' }),
+            typeof sr.content_json === 'string' ? sr.content_json : JSON.stringify(sr.content_json || {}),
+            Number(sr.sort_order ?? (i + 1) * 10),
+            String(sr.status || 'published'),
+            sr.visible === undefined ? 1 : sr.visible ? 1 : 0,
+            String(sr.audience || 'all'),
+            sr.targeting_json ? (typeof sr.targeting_json === 'string' ? sr.targeting_json : JSON.stringify(sr.targeting_json)) : null,
+            sr.style_json ? (typeof sr.style_json === 'string' ? sr.style_json : JSON.stringify(sr.style_json)) : null,
+            Number(sr.schedule_priority ?? 0),
+            sr.starts_at ? String(sr.starts_at) : null,
+            sr.ends_at ? String(sr.ends_at) : null,
+            Number(sr.version ?? 1) + 1,
+            actorUserId,
+            now,
+          ]
+        );
+      }
+
+      const kCol = this.keyCol();
+      const chromeStr = JSON.stringify(chromeObj);
+      for (const settingKey of ['site_chrome_draft', 'site_chrome_published']) {
+        await tx.execute(
+          this.db.driver === 'mysql'
+            ? `INSERT INTO settings (${kCol}, value_json, updated_at) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE value_json = VALUES(value_json), updated_at = VALUES(updated_at)`
+            : `INSERT INTO settings (${kCol}, value_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
+          [settingKey, chromeStr, now]
+        );
+      }
+
+      const maxVerRow = await tx.queryOne<{ max_v: number | null }>('SELECT MAX(version) AS max_v FROM home_page_snapshots');
+      const nextVersion = Number(maxVerRow?.max_v ?? 0) + 1;
+      const newId = `hps-${crypto.randomUUID()}`;
+      const note = `Rolled back full page to v${Number(target.version)}`;
+      await tx.execute(
+        `INSERT INTO home_page_snapshots (id, version, status, change_note, sections_snapshot_json, chrome_snapshot_json, published_at, created_by_user_id, created_at)
+         VALUES (?, ?, 'published', ?, ?, ?, ?, ?, ?)`,
+        [newId, nextVersion, note, JSON.stringify(sectionsArr), chromeStr, now, actorUserId, now]
+      );
+
+      await writeAuditLog(tx, {
+        actorUserId,
+        action: 'admin.rollback_home_page',
+        entityType: 'home_page',
+        entityId: newId,
+        after: { restoredFromVersion: Number(target.version), newVersion: nextVersion },
+        ipAddress,
+      });
+
+      return {
+        id: newId,
+        version: nextVersion,
+        status: 'published' as const,
+        changeNote: note,
+        scheduledPublishAt: null,
+        publishedAt: now,
+        createdByUserId: actorUserId,
+        createdAt: now,
+        sectionCount: sectionsArr.length,
+      };
+    });
+
+    this.invalidateHomeCache();
+    return result;
+  }
+
+  async adminSaveSiteChrome(
+    chrome: SiteChromeSettings,
+    publishNow: boolean,
+    actorUserId: string,
+    ipAddress?: string
+  ): Promise<SiteChromeSettings> {
+    const now = toSqlTimestamp();
+    const clean: SiteChromeSettings = { ...chrome, updatedAt: now };
+    const kCol = this.keyCol();
+    const jsonVal = JSON.stringify(clean);
+
+    const keys = publishNow ? ['site_chrome_draft', 'site_chrome_published'] : ['site_chrome_draft'];
+    for (const k of keys) {
+      await this.db.execute(
+        this.db.driver === 'mysql'
+          ? `INSERT INTO settings (${kCol}, value_json, updated_at) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE value_json = VALUES(value_json), updated_at = VALUES(updated_at)`
+          : `INSERT INTO settings (${kCol}, value_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
+        [k, jsonVal, now]
+      );
+    }
+
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: publishNow ? 'admin.publish_site_chrome' : 'admin.save_site_chrome_draft',
+      entityType: 'site_chrome',
+      entityId: 'global',
+      after: { publishNow, linksCount: clean.headerLinks.length },
+      ipAddress,
+    });
+    this.invalidateHomeCache();
+    return clean;
+  }
+
+  async adminListSectionTemplates(): Promise<HomeSectionTemplate[]> {
+    const rows = await this.db.query<Record<string, unknown>>(
+      'SELECT * FROM home_section_templates ORDER BY is_system DESC, created_at DESC'
+    );
+    return rows.map((r) => ({
+      id: String(r.id),
+      name: parseJson<LocalizedText>(r.name_json, { en: 'Template', ar: 'قالب' }),
+      description: parseJson<LocalizedText>(r.description_json, { en: '', ar: '' }),
+      sectionType: mapLegacySectionType(String(r.section_type)),
+      content: parseJson<Record<string, unknown>>(r.content_json, {}),
+      style: parseJson<HomeSectionStyle>(r.style_json, { surface: 'graphite', padding: 'standard' }),
+      isSystem: Boolean(r.is_system),
+      createdAt: String(r.created_at),
+    }));
+  }
+
+  async adminCreateSectionTemplate(
+    actorUserId: string,
+    input: {
+      name: LocalizedText;
+      description?: LocalizedText;
+      sectionType: HomeSectionType;
+      content: Record<string, unknown>;
+      style?: HomeSectionStyle;
+    },
+    ipAddress?: string
+  ): Promise<HomeSectionTemplate> {
+    const id = `tmpl-${crypto.randomUUID()}`;
+    const now = toSqlTimestamp();
+    const desc = input.description || { en: 'Saved custom section template', ar: 'قالب قسم محفوظ' };
+    await this.db.execute(
+      `INSERT INTO home_section_templates (id, name_json, description_json, section_type, content_json, style_json, is_system, created_by_user_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+      [
+        id,
+        JSON.stringify(input.name),
+        JSON.stringify(desc),
+        input.sectionType,
+        JSON.stringify(input.content || {}),
+        JSON.stringify(input.style || { surface: 'graphite', padding: 'standard' }),
+        actorUserId,
+        now,
+      ]
+    );
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.create_home_template',
+      entityType: 'home_section_template',
+      entityId: id,
+      after: { name: input.name, sectionType: input.sectionType },
+      ipAddress,
+    });
+    return {
+      id,
+      name: input.name,
+      description: desc,
+      sectionType: input.sectionType,
+      content: input.content || {},
+      style: input.style,
+      isSystem: false,
+      createdAt: now,
+    };
+  }
+
+  async adminDeleteSectionTemplate(templateId: string, actorUserId: string, ipAddress?: string): Promise<void> {
+    const row = await this.db.queryOne<{ is_system: number | boolean }>('SELECT is_system FROM home_section_templates WHERE id = ?', [
+      templateId,
+    ]);
+    if (!row) throw new Error('Template not found.');
+    if (Boolean(row.is_system)) throw new Error('Starter system templates cannot be deleted.');
+    await this.db.execute('DELETE FROM home_section_templates WHERE id = ?', [templateId]);
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.delete_home_template',
+      entityType: 'home_section_template',
+      entityId: templateId,
+      ipAddress,
+    });
+  }
+
+  async adminListMediaLibrary(folderFilter?: string): Promise<MediaAsset[]> {
+    const [mediaRows, sections, stores, prodMedia] = await Promise.all([
+      this.db.query<Record<string, unknown>>(
+        folderFilter && folderFilter !== 'all'
+          ? 'SELECT * FROM media WHERE folder = ? ORDER BY created_at DESC LIMIT 200'
+          : 'SELECT * FROM media ORDER BY created_at DESC LIMIT 200',
+        folderFilter && folderFilter !== 'all' ? [folderFilter] : []
+      ),
+      this.db.query<{ id: string; title_json: string; content_json: string }>('SELECT id, title_json, content_json FROM home_sections'),
+      this.db.query<{ id: string; name_json: string; logo_media_id: string | null; banner_media_id: string | null }>(
+        'SELECT id, name_json, logo_media_id, banner_media_id FROM stores'
+      ),
+      this.db.query<{ id: string; entity_id: string | null }>('SELECT id, entity_id FROM media WHERE entity_type = ?', ['product_image']),
+    ]);
+
+    return mediaRows.map((m) => {
+      const publicUrl = String(m.public_url);
+      const id = String(m.id);
+      const usedIn: MediaAsset['usedIn'] = [];
+
+      for (const sec of sections) {
+        const cStr = typeof sec.content_json === 'string' ? sec.content_json : JSON.stringify(sec.content_json || {});
+        if (cStr.includes(publicUrl) || cStr.includes(id)) {
+          const title = parseJson<LocalizedText>(sec.title_json, { en: sec.id, ar: sec.id });
+          usedIn.push({ kind: 'home_section', id: sec.id, label: title.en || sec.id });
+        }
+      }
+      for (const st of stores) {
+        if (st.logo_media_id === id || st.banner_media_id === id) {
+          const name = parseJson<LocalizedText>(st.name_json, { en: st.id, ar: st.id });
+          usedIn.push({ kind: 'store', id: st.id, label: name.en || st.id });
+        }
+      }
+      for (const pm of prodMedia) {
+        if (pm.id === id && pm.entity_id) {
+          usedIn.push({ kind: 'product', id: pm.entity_id, label: `Product ${pm.entity_id.slice(0, 10)}` });
+        }
+      }
+
+      return {
+        id,
+        ownerUserId: String(m.owner_user_id),
+        entityType: String(m.entity_type),
+        folder: String(m.folder || 'general'),
+        publicUrl,
+        mimeType: String(m.mime_type),
+        sizeBytes: Number(m.size_bytes ?? 0),
+        width: m.width === null || m.width === undefined ? null : Number(m.width),
+        height: m.height === null || m.height === undefined ? null : Number(m.height),
+        alt: parseJson<LocalizedText>(m.alt_json, { en: '', ar: '' }),
+        focalX: Number(m.focal_x ?? 50),
+        focalY: Number(m.focal_y ?? 50),
+        createdAt: String(m.created_at),
+        usedIn,
+      };
+    });
+  }
+
+  async adminUpdateMediaAsset(
+    mediaId: string,
+    patch: { folder?: string; alt?: LocalizedText; focalX?: number; focalY?: number }
+  ): Promise<MediaAsset> {
+    const existing = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM media WHERE id = ?', [mediaId]);
+    if (!existing) throw new Error('Media asset not found.');
+    const nextFolder = patch.folder ? patch.folder.replace(/[^a-z0-9_-]/gi, '').slice(0, 60) || 'general' : String(existing.folder || 'general');
+    const nextAlt = patch.alt !== undefined ? patch.alt : parseJson<LocalizedText>(existing.alt_json, { en: '', ar: '' });
+    const nextFx = patch.focalX !== undefined ? Math.max(0, Math.min(100, Math.round(patch.focalX))) : Number(existing.focal_x ?? 50);
+    const nextFy = patch.focalY !== undefined ? Math.max(0, Math.min(100, Math.round(patch.focalY))) : Number(existing.focal_y ?? 50);
+
+    await this.db.execute('UPDATE media SET folder = ?, alt_json = ?, focal_x = ?, focal_y = ? WHERE id = ?', [
+      nextFolder,
+      JSON.stringify(nextAlt),
+      nextFx,
+      nextFy,
+      mediaId,
+    ]);
+    const list = await this.adminListMediaLibrary();
+    return list.find((item) => item.id === mediaId)!;
+  }
+
+  async adminDeleteMediaAsset(mediaId: string, actorUserId: string, ipAddress?: string): Promise<void> {
+    const list = await this.adminListMediaLibrary();
+    const target = list.find((m) => m.id === mediaId);
+    if (!target) throw new Error('Media asset not found.');
+    if (target.usedIn.length > 0) {
+      throw new Error(`Media is in use (${target.usedIn.map((u) => u.label).join(', ')}). Replace references before deleting.`);
+    }
+    await this.db.execute('DELETE FROM media WHERE id = ?', [mediaId]);
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.delete_media',
+      entityType: 'media',
+      entityId: mediaId,
+      after: { publicUrl: target.publicUrl },
+      ipAddress,
+    });
+  }
+
+  async subscribeNewsletter(email: string, locale: 'en' | 'ar', source = 'home') {
+    const cleanEmail = email.trim().toLowerCase();
+    if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      throw new Error(locale === 'ar' ? 'أدخل بريداً إلكترونياً صحيحاً' : 'Please enter a valid email address.');
+    }
+    const existing = await this.db.queryOne<{ id: string; status: string }>(
+      'SELECT id, status FROM newsletter_subscribers WHERE LOWER(email) = ?',
+      [cleanEmail]
+    );
+    const now = toSqlTimestamp();
+    if (existing) {
+      await this.db.execute(
+        "UPDATE newsletter_subscribers SET status = 'subscribed', locale = ?, source = ?, consented_at = ? WHERE id = ?",
+        [locale, source.slice(0, 60), now, existing.id]
+      );
+      return { id: existing.id, email: cleanEmail, status: 'subscribed' as const, alreadySubscribed: true };
+    }
+    const id = `sub-${crypto.randomUUID()}`;
+    const token = crypto.randomBytes(24).toString('hex');
+    await this.db.execute(
+      `INSERT INTO newsletter_subscribers (id, email, locale, source, status, unsubscribe_token, consented_at, created_at)
+       VALUES (?, ?, ?, ?, 'subscribed', ?, ?, ?)`,
+      [id, cleanEmail, locale, source.slice(0, 60), token, now, now]
+    );
+    return { id, email: cleanEmail, status: 'subscribed' as const, alreadySubscribed: false };
+  }
+
+  // --- Step 3: Multi-Placement Banners, Bot-Filtered Tracking, Popups & Featured Placements ---
   private mapBannerRow(row: Record<string, unknown>): OfferBanner {
     const rawTitle = parseJson<{ en: string; ar: string; ctaEn?: string; ctaAr?: string }>(row.title_json, {
       en: '',
@@ -2847,9 +3542,16 @@ export class MarketplaceRepo {
       bgToken: String(row.bg_token || 'graphite') as BannerBgToken,
       targetUrl: String(row.target_url || '/catalog'),
       pages: parseJson<BannerPageScope[]>(row.pages_json, ['home']),
+      placement: String(row.placement || 'page_strip') as BannerPlacementType,
+      imageUrl: row.image_url ? String(row.image_url) : null,
+      dismissible: row.dismissible === undefined ? true : Boolean(row.dismissible),
+      audience: String(row.audience || 'all') as MarketingAudienceType,
+      deviceTarget: String(row.device_target || 'all') as DeviceTargetType,
+      categorySlug: row.category_slug ? String(row.category_slug) : null,
       priority: Number(row.priority ?? 0),
       impressions: Number(row.impressions ?? 0),
       clicks: Number(row.clicks ?? 0),
+      botFilteredCount: Number(row.bot_filtered_count ?? 0),
       startsAt: row.starts_at ? String(row.starts_at) : null,
       endsAt: row.ends_at ? String(row.ends_at) : null,
       active: Boolean(row.active),
@@ -2883,6 +3585,12 @@ export class MarketplaceRepo {
       bgToken: BannerBgToken;
       targetUrl: string;
       pages: BannerPageScope[];
+      placement?: BannerPlacementType;
+      imageUrl?: string | null;
+      dismissible?: boolean;
+      audience?: MarketingAudienceType;
+      deviceTarget?: DeviceTargetType;
+      categorySlug?: string | null;
       priority?: number;
       startsAt?: string | null;
       endsAt?: string | null;
@@ -2898,14 +3606,20 @@ export class MarketplaceRepo {
       ctaAr: input.ctaLabel?.ar?.trim() || undefined,
     };
     await this.db.execute(
-      `INSERT INTO banners (id, title_json, bg_token, target_url, pages_json, priority, impressions, clicks, starts_at, ends_at, active)
-       VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)`,
+      `INSERT INTO banners (id, title_json, bg_token, target_url, pages_json, placement, image_url, dismissible, audience, device_target, category_slug, priority, impressions, clicks, bot_filtered_count, starts_at, ends_at, active)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?)`,
       [
         id,
         JSON.stringify(storedTitle),
         input.bgToken,
         input.targetUrl.trim() || '/catalog',
         JSON.stringify(input.pages.length > 0 ? input.pages : ['home']),
+        input.placement || 'page_strip',
+        input.imageUrl ? input.imageUrl.trim() : null,
+        input.dismissible === false ? 0 : 1,
+        input.audience || 'all',
+        input.deviceTarget || 'all',
+        input.categorySlug ? input.categorySlug.trim() : null,
         Math.trunc(input.priority ?? 10),
         input.startsAt ? toSqlTimestamp(new Date(input.startsAt)) : null,
         input.endsAt ? toSqlTimestamp(new Date(input.endsAt)) : null,
@@ -2917,7 +3631,7 @@ export class MarketplaceRepo {
       action: 'admin.create_banner',
       entityType: 'banner',
       entityId: id,
-      after: { bgToken: input.bgToken, pages: input.pages },
+      after: { bgToken: input.bgToken, placement: input.placement || 'page_strip', pages: input.pages },
       ipAddress,
     });
     const row = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM banners WHERE id = ?', [id]);
@@ -2933,6 +3647,12 @@ export class MarketplaceRepo {
       bgToken?: BannerBgToken;
       targetUrl?: string;
       pages?: BannerPageScope[];
+      placement?: BannerPlacementType;
+      imageUrl?: string | null;
+      dismissible?: boolean;
+      audience?: MarketingAudienceType;
+      deviceTarget?: DeviceTargetType;
+      categorySlug?: string | null;
       priority?: number;
       startsAt?: string | null;
       endsAt?: string | null;
@@ -2952,12 +3672,18 @@ export class MarketplaceRepo {
     };
 
     await this.db.execute(
-      `UPDATE banners SET title_json = ?, bg_token = ?, target_url = ?, pages_json = ?, priority = ?, starts_at = ?, ends_at = ?, active = ? WHERE id = ?`,
+      `UPDATE banners SET title_json = ?, bg_token = ?, target_url = ?, pages_json = ?, placement = ?, image_url = ?, dismissible = ?, audience = ?, device_target = ?, category_slug = ?, priority = ?, starts_at = ?, ends_at = ?, active = ? WHERE id = ?`,
       [
         JSON.stringify(nextTitleObj),
         patch.bgToken ?? existing.bgToken,
         patch.targetUrl ?? existing.targetUrl,
         JSON.stringify(patch.pages ?? existing.pages),
+        patch.placement ?? existing.placement,
+        patch.imageUrl !== undefined ? (patch.imageUrl ? patch.imageUrl.trim() : null) : existing.imageUrl ?? null,
+        patch.dismissible !== undefined ? (patch.dismissible ? 1 : 0) : existing.dismissible ? 1 : 0,
+        patch.audience ?? existing.audience,
+        patch.deviceTarget ?? existing.deviceTarget,
+        patch.categorySlug !== undefined ? (patch.categorySlug ? patch.categorySlug.trim() : null) : existing.categorySlug ?? null,
         patch.priority !== undefined ? Math.trunc(patch.priority) : existing.priority,
         patch.startsAt !== undefined ? (patch.startsAt ? toSqlTimestamp(new Date(patch.startsAt)) : null) : existing.startsAt,
         patch.endsAt !== undefined ? (patch.endsAt ? toSqlTimestamp(new Date(patch.endsAt)) : null) : existing.endsAt,
@@ -2988,9 +3714,504 @@ export class MarketplaceRepo {
     });
   }
 
-  async trackBannerEvent(id: string, event: 'impression' | 'click'): Promise<void> {
-    const col = event === 'click' ? 'clicks' : 'impressions';
-    await this.db.execute(`UPDATE banners SET ${col} = ${col} + 1 WHERE id = ?`, [id]);
+  private isBotTraffic(userAgent: string): boolean {
+    const ua = (userAgent || '').trim();
+    if (!ua || ua.length < 4) return true;
+    return /bot|crawl|spider|slurp|mediapartners|facebookexternalhit|bingpreview|headless|lighthouse|phantomjs|puppeteer|playwright|curl\/|wget\/|python-requests|scrapy|ahrefs|semrush|mj12bot|dotbot|bytespider|gptbot|claudebot|yandex|baidu/i.test(
+      ua
+    );
+  }
+
+  async trackMarketingEvent(params: {
+    kind: 'banner' | 'popup' | 'featured';
+    id: string;
+    event: 'impression' | 'click' | 'conversion' | 'dismissal';
+    ip: string;
+    userAgent: string;
+    sessionHint?: string;
+  }): Promise<{ counted: boolean; reason: 'bot_filtered' | 'deduplicated' | null }> {
+    const table =
+      params.kind === 'banner'
+        ? 'banners'
+        : params.kind === 'popup'
+          ? 'marketing_popups'
+          : 'featured_placements';
+
+    if (this.isBotTraffic(params.userAgent)) {
+      await this.db.execute(`UPDATE ${table} SET bot_filtered_count = bot_filtered_count + 1 WHERE id = ?`, [params.id]);
+      return { counted: false, reason: 'bot_filtered' };
+    }
+
+    const col =
+      params.event === 'click'
+        ? 'clicks'
+        : params.event === 'conversion'
+          ? 'conversions'
+          : params.event === 'dismissal'
+            ? 'dismissals'
+            : 'impressions';
+
+    const visitorHash = sha256Hex(`${params.ip}|${params.userAgent.slice(0, 120)}|${params.sessionHint || ''}`).slice(0, 48);
+    const windowMs = params.event === 'impression' ? 10 * 60_000 : 60_000;
+    const bucketKey = String(Math.floor(Date.now() / windowMs));
+    const dedupSql =
+      this.db.driver === 'mysql'
+        ? 'INSERT IGNORE INTO marketing_events_dedup (id, entity_kind, entity_id, event_type, visitor_hash, bucket_key) VALUES (?, ?, ?, ?, ?, ?)'
+        : 'INSERT OR IGNORE INTO marketing_events_dedup (id, entity_kind, entity_id, event_type, visitor_hash, bucket_key) VALUES (?, ?, ?, ?, ?, ?)';
+
+    const dedupRes = await this.db.execute(dedupSql, [
+      `mkd-${crypto.randomUUID()}`,
+      params.kind,
+      params.id,
+      params.event,
+      visitorHash,
+      bucketKey,
+    ]);
+
+    if (dedupRes.affectedRows === 0) {
+      return { counted: false, reason: 'deduplicated' };
+    }
+
+    await this.db.execute(`UPDATE ${table} SET ${col} = ${col} + 1 WHERE id = ?`, [params.id]);
+    return { counted: true, reason: null };
+  }
+
+  async trackBannerEvent(
+    id: string,
+    event: 'impression' | 'click',
+    meta?: { ip?: string; userAgent?: string; sessionHint?: string }
+  ): Promise<{ counted: boolean; reason: 'bot_filtered' | 'deduplicated' | null }> {
+    return this.trackMarketingEvent({
+      kind: 'banner',
+      id,
+      event,
+      ip: meta?.ip || 'unknown',
+      userAgent: meta?.userAgent || 'Mozilla/5.0',
+      sessionHint: meta?.sessionHint,
+    });
+  }
+
+  // --- Marketing Popups & Frequency Caps ---
+  private mapPopupRow(row: Record<string, unknown>): MarketingPopup {
+    return {
+      id: String(row.id),
+      title: parseJson<LocalizedText>(row.title_json, { en: '', ar: '' }),
+      body: parseJson<LocalizedText>(row.body_json, { en: '', ar: '' }),
+      ctaLabel: parseJson<LocalizedText>(row.cta_label_json, { en: 'Shop Now', ar: 'تسوق الآن' }),
+      targetUrl: String(row.target_url || '/catalog'),
+      imageUrl: row.image_url ? String(row.image_url) : null,
+      bgToken: String(row.bg_token || 'ember') as BannerBgToken,
+      popupType: String(row.popup_type || 'promo') as PopupType,
+      triggerType: String(row.trigger_type || 'delay_seconds') as PopupTrigger,
+      triggerValue: Number(row.trigger_value ?? 5),
+      frequencyCap: String(row.frequency_cap || 'once_per_day') as PopupFrequency,
+      pages: parseJson<BannerPageScope[]>(row.pages_json, ['home']),
+      audience: String(row.audience || 'all') as MarketingAudienceType,
+      deviceTarget: String(row.device_target || 'all') as DeviceTargetType,
+      showNewsletterForm: Boolean(row.show_newsletter_form),
+      couponCode: row.coupon_code ? String(row.coupon_code) : null,
+      startsAt: row.starts_at ? String(row.starts_at) : null,
+      endsAt: row.ends_at ? String(row.ends_at) : null,
+      active: Boolean(row.active),
+      impressions: Number(row.impressions ?? 0),
+      conversions: Number(row.conversions ?? 0),
+      dismissals: Number(row.dismissals ?? 0),
+      botFilteredCount: Number(row.bot_filtered_count ?? 0),
+    };
+  }
+
+  async getActivePopups(): Promise<MarketingPopup[]> {
+    const rows = await this.db.query<Record<string, unknown>>(
+      'SELECT * FROM marketing_popups WHERE active = 1 ORDER BY created_at DESC'
+    );
+    const nowMs = Date.now();
+    return rows.map((r) => this.mapPopupRow(r)).filter((p) => isWithinSchedule(p.startsAt, p.endsAt, nowMs));
+  }
+
+  async adminListPopups(): Promise<MarketingPopup[]> {
+    const rows = await this.db.query<Record<string, unknown>>('SELECT * FROM marketing_popups ORDER BY created_at DESC');
+    return rows.map((r) => this.mapPopupRow(r));
+  }
+
+  async adminCreatePopup(
+    actorUserId: string,
+    input: {
+      title: LocalizedText;
+      body: LocalizedText;
+      ctaLabel: LocalizedText;
+      targetUrl: string;
+      imageUrl?: string | null;
+      bgToken: BannerBgToken;
+      popupType: PopupType;
+      triggerType: PopupTrigger;
+      triggerValue: number;
+      frequencyCap: PopupFrequency;
+      pages: BannerPageScope[];
+      audience: MarketingAudienceType;
+      deviceTarget: DeviceTargetType;
+      showNewsletterForm?: boolean;
+      couponCode?: string | null;
+      startsAt?: string | null;
+      endsAt?: string | null;
+      active?: boolean;
+    },
+    ipAddress?: string
+  ): Promise<MarketingPopup> {
+    const id = `pop-${crypto.randomUUID()}`;
+    await this.db.execute(
+      `INSERT INTO marketing_popups (id, title_json, body_json, cta_label_json, target_url, image_url, bg_token, popup_type, trigger_type, trigger_value, frequency_cap, pages_json, audience, device_target, show_newsletter_form, coupon_code, starts_at, ends_at, active)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        JSON.stringify(input.title),
+        JSON.stringify(input.body),
+        JSON.stringify(input.ctaLabel),
+        input.targetUrl.trim() || '/catalog',
+        input.imageUrl ? input.imageUrl.trim() : null,
+        input.bgToken,
+        input.popupType,
+        input.triggerType,
+        Math.max(0, Math.trunc(input.triggerValue)),
+        input.frequencyCap,
+        JSON.stringify(input.pages.length > 0 ? input.pages : ['home']),
+        input.audience,
+        input.deviceTarget,
+        input.showNewsletterForm ? 1 : 0,
+        input.couponCode ? input.couponCode.trim().toUpperCase() : null,
+        input.startsAt ? toSqlTimestamp(new Date(input.startsAt)) : null,
+        input.endsAt ? toSqlTimestamp(new Date(input.endsAt)) : null,
+        input.active === false ? 0 : 1,
+      ]
+    );
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.create_popup',
+      entityType: 'marketing_popup',
+      entityId: id,
+      after: { popupType: input.popupType, triggerType: input.triggerType, frequencyCap: input.frequencyCap },
+      ipAddress,
+    });
+    const row = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM marketing_popups WHERE id = ?', [id]);
+    return this.mapPopupRow(row!);
+  }
+
+  async adminUpdatePopup(
+    id: string,
+    actorUserId: string,
+    patch: Partial<{
+      title: LocalizedText;
+      body: LocalizedText;
+      ctaLabel: LocalizedText;
+      targetUrl: string;
+      imageUrl: string | null;
+      bgToken: BannerBgToken;
+      popupType: PopupType;
+      triggerType: PopupTrigger;
+      triggerValue: number;
+      frequencyCap: PopupFrequency;
+      pages: BannerPageScope[];
+      audience: MarketingAudienceType;
+      deviceTarget: DeviceTargetType;
+      showNewsletterForm: boolean;
+      couponCode: string | null;
+      startsAt: string | null;
+      endsAt: string | null;
+      active: boolean;
+    }>,
+    ipAddress?: string
+  ): Promise<MarketingPopup> {
+    const existingRow = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM marketing_popups WHERE id = ?', [id]);
+    if (!existingRow) throw new Error('Popup not found.');
+    const existing = this.mapPopupRow(existingRow);
+
+    await this.db.execute(
+      `UPDATE marketing_popups SET title_json = ?, body_json = ?, cta_label_json = ?, target_url = ?, image_url = ?, bg_token = ?, popup_type = ?, trigger_type = ?, trigger_value = ?, frequency_cap = ?, pages_json = ?, audience = ?, device_target = ?, show_newsletter_form = ?, coupon_code = ?, starts_at = ?, ends_at = ?, active = ? WHERE id = ?`,
+      [
+        JSON.stringify(patch.title ?? existing.title),
+        JSON.stringify(patch.body ?? existing.body),
+        JSON.stringify(patch.ctaLabel ?? existing.ctaLabel),
+        patch.targetUrl ?? existing.targetUrl,
+        patch.imageUrl !== undefined ? (patch.imageUrl ? patch.imageUrl.trim() : null) : existing.imageUrl ?? null,
+        patch.bgToken ?? existing.bgToken,
+        patch.popupType ?? existing.popupType,
+        patch.triggerType ?? existing.triggerType,
+        patch.triggerValue !== undefined ? Math.max(0, Math.trunc(patch.triggerValue)) : existing.triggerValue,
+        patch.frequencyCap ?? existing.frequencyCap,
+        JSON.stringify(patch.pages ?? existing.pages),
+        patch.audience ?? existing.audience,
+        patch.deviceTarget ?? existing.deviceTarget,
+        patch.showNewsletterForm !== undefined ? (patch.showNewsletterForm ? 1 : 0) : existing.showNewsletterForm ? 1 : 0,
+        patch.couponCode !== undefined ? (patch.couponCode ? patch.couponCode.trim().toUpperCase() : null) : existing.couponCode ?? null,
+        patch.startsAt !== undefined ? (patch.startsAt ? toSqlTimestamp(new Date(patch.startsAt)) : null) : existing.startsAt,
+        patch.endsAt !== undefined ? (patch.endsAt ? toSqlTimestamp(new Date(patch.endsAt)) : null) : existing.endsAt,
+        patch.active !== undefined ? (patch.active ? 1 : 0) : existing.active ? 1 : 0,
+        id,
+      ]
+    );
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.update_popup',
+      entityType: 'marketing_popup',
+      entityId: id,
+      after: patch,
+      ipAddress,
+    });
+    const row = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM marketing_popups WHERE id = ?', [id]);
+    return this.mapPopupRow(row!);
+  }
+
+  async adminDeletePopup(id: string, actorUserId: string, ipAddress?: string): Promise<void> {
+    await this.db.execute('DELETE FROM marketing_popups WHERE id = ?', [id]);
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.delete_popup',
+      entityType: 'marketing_popup',
+      entityId: id,
+      ipAddress,
+    });
+  }
+
+  // --- Featured Placements (Sponsored / Editorial Slots + Optional Ledger Fee) ---
+  private mapFeaturedPlacementRow(row: Record<string, unknown>): FeaturedPlacement {
+    return {
+      id: String(row.id),
+      slotKey: String(row.slot_key) as FeaturedSlotKey,
+      targetType: String(row.target_type) as FeaturedPlacementTargetType,
+      targetId: String(row.target_id),
+      sellerId: String(row.seller_id),
+      targetLabel: row.target_label_json ? parseJson<LocalizedText>(row.target_label_json, { en: 'Featured', ar: 'مميز' }) : null,
+      sellerName: row.seller_name_json ? parseJson<LocalizedText>(row.seller_name_json, { en: 'Store', ar: 'متجر' }) : null,
+      badgeText: parseJson<LocalizedText>(row.badge_json, { en: 'Featured', ar: 'مميز' }),
+      priority: Number(row.priority ?? 10),
+      feeUsdCents: Number(row.fee_usd_cents ?? 0),
+      ledgerCharged: Boolean(row.ledger_charged),
+      ledgerEntryId: row.ledger_entry_id ? String(row.ledger_entry_id) : null,
+      startsAt: row.starts_at ? String(row.starts_at) : null,
+      endsAt: row.ends_at ? String(row.ends_at) : null,
+      active: Boolean(row.active),
+      impressions: Number(row.impressions ?? 0),
+      clicks: Number(row.clicks ?? 0),
+      botFilteredCount: Number(row.bot_filtered_count ?? 0),
+      createdAt: String(row.created_at),
+    };
+  }
+
+  async getActiveFeaturedPlacements(): Promise<FeaturedPlacement[]> {
+    const rows = await this.db.query<Record<string, unknown>>(
+      `SELECT fp.*,
+              st.name_json AS seller_name_json,
+              COALESCE(p.title_json, st2.name_json) AS target_label_json
+       FROM featured_placements fp
+       LEFT JOIN stores st ON st.seller_id = fp.seller_id
+       LEFT JOIN products p ON fp.target_type = 'product' AND p.id = fp.target_id
+       LEFT JOIN stores st2 ON fp.target_type = 'store' AND st2.seller_id = fp.target_id
+       WHERE fp.active = 1
+       ORDER BY fp.priority DESC, fp.created_at DESC`
+    );
+    const nowMs = Date.now();
+    return rows
+      .map((r) => this.mapFeaturedPlacementRow(r))
+      .filter((fp) => isWithinSchedule(fp.startsAt, fp.endsAt, nowMs));
+  }
+
+  async adminListFeaturedPlacements(): Promise<FeaturedPlacement[]> {
+    const rows = await this.db.query<Record<string, unknown>>(
+      `SELECT fp.*,
+              st.name_json AS seller_name_json,
+              COALESCE(p.title_json, st2.name_json) AS target_label_json
+       FROM featured_placements fp
+       LEFT JOIN stores st ON st.seller_id = fp.seller_id
+       LEFT JOIN products p ON fp.target_type = 'product' AND p.id = fp.target_id
+       LEFT JOIN stores st2 ON fp.target_type = 'store' AND st2.seller_id = fp.target_id
+       ORDER BY fp.priority DESC, fp.created_at DESC`
+    );
+    return rows.map((r) => this.mapFeaturedPlacementRow(r));
+  }
+
+  async adminCreateFeaturedPlacement(
+    actorUserId: string,
+    input: {
+      slotKey: FeaturedSlotKey;
+      targetType: FeaturedPlacementTargetType;
+      targetId: string;
+      badgeText: LocalizedText;
+      priority?: number;
+      feeUsdCents?: number;
+      chargeLedgerFee?: boolean;
+      startsAt?: string | null;
+      endsAt?: string | null;
+      active?: boolean;
+    },
+    ipAddress?: string
+  ): Promise<FeaturedPlacement> {
+    return this.db.transaction(async (tx) => {
+      let resolvedSellerId = '';
+      if (input.targetType === 'product') {
+        const prod = await tx.queryOne<{ seller_id: string }>('SELECT seller_id FROM products WHERE id = ? AND deleted_at IS NULL', [
+          input.targetId,
+        ]);
+        if (!prod) throw new Error('Target product not found.');
+        resolvedSellerId = prod.seller_id;
+      } else {
+        const seller = await tx.queryOne<{ id: string }>('SELECT id FROM sellers WHERE id = ? AND deleted_at IS NULL', [
+          input.targetId,
+        ]);
+        if (!seller) throw new Error('Target seller store not found.');
+        resolvedSellerId = seller.id;
+      }
+
+      const id = `fpl-${crypto.randomUUID()}`;
+      const feeCents = Math.max(0, Math.trunc(input.feeUsdCents ?? 0));
+      const shouldCharge = Boolean(input.chargeLedgerFee && feeCents > 0);
+      const now = toSqlTimestamp();
+      let ledgerEntryId: string | null = null;
+
+      if (shouldCharge) {
+        ledgerEntryId = `led-${crypto.randomUUID()}`;
+        await tx.execute(
+          `INSERT INTO ledger_entries (id, seller_id, entry_type, direction, amount_usd_cents, availability, note, created_at)
+           VALUES (?, ?, 'FEATURED_PLACEMENT_FEE', 'debit', ?, 'settled', ?, ?)`,
+          [
+            ledgerEntryId,
+            resolvedSellerId,
+            feeCents,
+            `Featured placement (${input.slotKey}) for ${input.targetType} ${input.targetId}`,
+            now,
+          ]
+        );
+      }
+
+      await tx.execute(
+        `INSERT INTO featured_placements (id, slot_key, target_type, target_id, seller_id, badge_json, priority, fee_usd_cents, ledger_charged, ledger_entry_id, starts_at, ends_at, active, created_by_user_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          id,
+          input.slotKey,
+          input.targetType,
+          input.targetId,
+          resolvedSellerId,
+          JSON.stringify(input.badgeText),
+          Math.trunc(input.priority ?? 10),
+          feeCents,
+          shouldCharge ? 1 : 0,
+          ledgerEntryId,
+          input.startsAt ? toSqlTimestamp(new Date(input.startsAt)) : null,
+          input.endsAt ? toSqlTimestamp(new Date(input.endsAt)) : null,
+          input.active === false ? 0 : 1,
+          actorUserId,
+          now,
+        ]
+      );
+
+      await writeAuditLog(tx, {
+        actorUserId,
+        action: 'admin.create_featured_placement',
+        entityType: 'featured_placement',
+        entityId: id,
+        after: { slotKey: input.slotKey, targetType: input.targetType, targetId: input.targetId, feeUsdCents: feeCents, ledgerCharged: shouldCharge },
+        ipAddress,
+      });
+
+      const row = await tx.queryOne<Record<string, unknown>>(
+        `SELECT fp.*,
+                st.name_json AS seller_name_json,
+                COALESCE(p.title_json, st2.name_json) AS target_label_json
+         FROM featured_placements fp
+         LEFT JOIN stores st ON st.seller_id = fp.seller_id
+         LEFT JOIN products p ON fp.target_type = 'product' AND p.id = fp.target_id
+         LEFT JOIN stores st2 ON fp.target_type = 'store' AND st2.seller_id = fp.target_id
+         WHERE fp.id = ?`,
+        [id]
+      );
+      return this.mapFeaturedPlacementRow(row!);
+    });
+  }
+
+  async adminUpdateFeaturedPlacement(
+    id: string,
+    actorUserId: string,
+    patch: Partial<{
+      slotKey: FeaturedSlotKey;
+      badgeText: LocalizedText;
+      priority: number;
+      startsAt: string | null;
+      endsAt: string | null;
+      active: boolean;
+      chargeLedgerFeeNow: boolean;
+    }>,
+    ipAddress?: string
+  ): Promise<FeaturedPlacement> {
+    return this.db.transaction(async (tx) => {
+      const existingRow = await tx.queryOne<Record<string, unknown>>('SELECT * FROM featured_placements WHERE id = ?', [id]);
+      if (!existingRow) throw new Error('Featured placement not found.');
+      const existing = this.mapFeaturedPlacementRow(existingRow);
+
+      let ledgerCharged = existing.ledgerCharged;
+      let ledgerEntryId = existing.ledgerEntryId ?? null;
+      if (patch.chargeLedgerFeeNow && !existing.ledgerCharged && existing.feeUsdCents > 0) {
+        ledgerEntryId = `led-${crypto.randomUUID()}`;
+        await tx.execute(
+          `INSERT INTO ledger_entries (id, seller_id, entry_type, direction, amount_usd_cents, availability, note, created_at)
+           VALUES (?, ?, 'FEATURED_PLACEMENT_FEE', 'debit', ?, 'settled', ?, ?)`,
+          [
+            ledgerEntryId,
+            existing.sellerId,
+            existing.feeUsdCents,
+            `Featured placement (${existing.slotKey}) fee`,
+            toSqlTimestamp(),
+          ]
+        );
+        ledgerCharged = true;
+      }
+
+      await tx.execute(
+        `UPDATE featured_placements SET slot_key = ?, badge_json = ?, priority = ?, ledger_charged = ?, ledger_entry_id = ?, starts_at = ?, ends_at = ?, active = ? WHERE id = ?`,
+        [
+          patch.slotKey ?? existing.slotKey,
+          JSON.stringify(patch.badgeText ?? existing.badgeText),
+          patch.priority !== undefined ? Math.trunc(patch.priority) : existing.priority,
+          ledgerCharged ? 1 : 0,
+          ledgerEntryId,
+          patch.startsAt !== undefined ? (patch.startsAt ? toSqlTimestamp(new Date(patch.startsAt)) : null) : existing.startsAt,
+          patch.endsAt !== undefined ? (patch.endsAt ? toSqlTimestamp(new Date(patch.endsAt)) : null) : existing.endsAt,
+          patch.active !== undefined ? (patch.active ? 1 : 0) : existing.active ? 1 : 0,
+          id,
+        ]
+      );
+
+      await writeAuditLog(tx, {
+        actorUserId,
+        action: 'admin.update_featured_placement',
+        entityType: 'featured_placement',
+        entityId: id,
+        after: patch,
+        ipAddress,
+      });
+
+      const row = await tx.queryOne<Record<string, unknown>>(
+        `SELECT fp.*,
+                st.name_json AS seller_name_json,
+                COALESCE(p.title_json, st2.name_json) AS target_label_json
+         FROM featured_placements fp
+         LEFT JOIN stores st ON st.seller_id = fp.seller_id
+         LEFT JOIN products p ON fp.target_type = 'product' AND p.id = fp.target_id
+         LEFT JOIN stores st2 ON fp.target_type = 'store' AND st2.seller_id = fp.target_id
+         WHERE fp.id = ?`,
+        [id]
+      );
+      return this.mapFeaturedPlacementRow(row!);
+    });
+  }
+
+  async adminDeleteFeaturedPlacement(id: string, actorUserId: string, ipAddress?: string): Promise<void> {
+    await this.db.execute('DELETE FROM featured_placements WHERE id = ?', [id]);
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.delete_featured_placement',
+      entityType: 'featured_placement',
+      entityId: id,
+      ipAddress,
+    });
   }
 
   // --- Phase B: Offers & Promotions Engine ---
