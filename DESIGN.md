@@ -59,3 +59,12 @@ NileLink uses an editorial **Hairline Grid** system: modular rectangular cells s
 
 ## 6. Approved Seller Storefront Themes
 Sellers select from 4 pre-audited themes (`obsidian-ember`, `sand-atelier`, `cyan-lab`, `sage-studio`) instead of arbitrary hex inputs, guaranteeing WCAG AA contrast across dark and light modes.
+
+---
+
+## 7. Home Page Builder & Marketing Hub Patterns
+- **Zero-Code Visual Editing**: Admin home sections (`hero`, `banner_strip`, `categories_grid`, `featured_products`, `flash_sale`, `deal_cards`, `featured_sellers`, `value_props`, `rich_block`, `newsletter`) and email campaigns (`header`, `hero_text`, `product_spotlight`, `coupon_box`, `cta_button`, `divider_footer`) are edited exclusively through bilingual EN/AR form controls with automatic `dir="rtl"` inputs and live side-by-side previews.
+- **No-Pill Hairline Badges**: All marketing chips (offer types, flash sale countdowns, segment filters, moderation statuses, and delivery statuses) use sharp `0–4px` bordered rectangular frames (`1px solid var(--line)` or semantic accent `--ember`/`--cedar`/`--gold`/`--cyan`), never rounded pill capsules.
+- **Server-Side Draft Isolation & Sanitization**: Draft home snapshots stay gated behind admin RBAC; HTML email previews render inside `<iframe sandbox="">` with escaped text and stripped `javascript:`/`data:` URLs.
+- **Integer Minor-Unit Offers & Attribution**: All discounts, flash prices, spend thresholds, and attribution GMV metrics are stored and computed in integer USD cents and integer LBP with tabular monospace alignment.
+

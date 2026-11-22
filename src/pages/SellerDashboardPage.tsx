@@ -10,6 +10,7 @@ import type {
   Product,
   Review,
   Seller,
+  SellerPromoRules,
   StorefrontThemeId,
   SubOrder,
   SubOrderStatus,
@@ -48,6 +49,7 @@ interface WorkspacePayload {
   payouts: PayoutRequest[];
   coupons: Coupon[];
   offers: Offer[];
+  sellerPromoRules?: SellerPromoRules;
   reviews: Review[];
   documents: Array<{ id: string; doc_type: string; review_status: string; public_url: string; created_at: string }>;
   commissionInfo: { bps: number; source: string };
@@ -1004,7 +1006,16 @@ export function SellerDashboardPage() {
                 Propose Store / Product Offer
               </h3>
               <p className="text-xs text-[var(--muted)]">
-                Seller offers enter Admin moderation queue and apply across product & checkout pricing once approved.
+                {workspace.sellerPromoRules ? (
+                  <>
+                    Marketplace Rules: Max {workspace.sellerPromoRules.maxDiscountPercent}% off · Max $
+                    {(workspace.sellerPromoRules.maxFixedDiscountUsdCents / 100).toFixed(0)} fixed · Up to{' '}
+                    {workspace.sellerPromoRules.maxActiveOffersPerSeller} active/pending offers ·{' '}
+                    {workspace.sellerPromoRules.requireAdminApproval ? 'Admin approval required' : 'Auto-approved'}
+                  </>
+                ) : (
+                  'Seller offers enter Admin moderation queue and apply across product & checkout pricing once approved.'
+                )}
               </p>
               <form
                 onSubmit={async (e) => {

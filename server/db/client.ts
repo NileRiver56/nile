@@ -272,14 +272,41 @@ class SqlitePreviewClient implements DbClient {
       );
       CREATE TABLE IF NOT EXISTS coupons (
         id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, seller_id TEXT, discount_type TEXT NOT NULL DEFAULT 'percent',
-        discount_value INTEGER NOT NULL, min_order_usd_cents INTEGER NOT NULL DEFAULT 0, max_uses INTEGER,
-        per_customer_limit INTEGER NOT NULL DEFAULT 1, used_count INTEGER NOT NULL DEFAULT 0,
+        discount_value INTEGER NOT NULL, max_discount_usd_cents INTEGER, min_order_usd_cents INTEGER NOT NULL DEFAULT 0,
+        target_type TEXT NOT NULL DEFAULT 'all', target_id TEXT, campaign_id TEXT,
+        max_uses INTEGER, per_customer_limit INTEGER NOT NULL DEFAULT 1, used_count INTEGER NOT NULL DEFAULT 0,
+        first_order_only INTEGER NOT NULL DEFAULT 0, auto_generated_batch TEXT,
         starts_at TEXT, ends_at TEXT, active INTEGER NOT NULL DEFAULT 1
+      );
+      CREATE TABLE IF NOT EXISTS coupon_redemptions (
+        id TEXT PRIMARY KEY, coupon_id TEXT NOT NULL, user_id TEXT, customer_phone_norm TEXT NOT NULL,
+        order_id TEXT NOT NULL, discount_usd_cents INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
       CREATE TABLE IF NOT EXISTS offers (
         id TEXT PRIMARY KEY, seller_id TEXT, title_json TEXT NOT NULL, offer_type TEXT NOT NULL,
         discount_value INTEGER NOT NULL, target_type TEXT NOT NULL, target_id TEXT,
+        stacking_rule TEXT NOT NULL DEFAULT 'best_only', funding_source TEXT NOT NULL DEFAULT 'platform',
+        funding_platform_bps INTEGER NOT NULL DEFAULT 10000, campaign_id TEXT,
+        priority INTEGER NOT NULL DEFAULT 10, rules_json TEXT,
         approval_status TEXT NOT NULL DEFAULT 'pending', starts_at TEXT, ends_at TEXT, active INTEGER NOT NULL DEFAULT 1
+      );
+      CREATE TABLE IF NOT EXISTS flash_sales (
+        id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, title_json TEXT NOT NULL, bg_token TEXT NOT NULL DEFAULT 'ember',
+        starts_at TEXT NOT NULL, ends_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'scheduled',
+        auto_revert INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS flash_sale_items (
+        id TEXT PRIMARY KEY, flash_sale_id TEXT NOT NULL, product_id TEXT NOT NULL,
+        sale_price_usd_cents INTEGER NOT NULL, discount_percent INTEGER NOT NULL,
+        stock_cap INTEGER NOT NULL DEFAULT 0, claimed_count INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS campaigns (
+        id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, title_json TEXT NOT NULL,
+        subtitle_json TEXT NOT NULL, description_json TEXT NOT NULL, hero_image_url TEXT,
+        bg_token TEXT NOT NULL DEFAULT 'ember', starts_at TEXT, ends_at TEXT,
+        status TEXT NOT NULL DEFAULT 'draft', featured_offer_ids_json TEXT NOT NULL,
+        featured_coupon_codes_json TEXT NOT NULL, featured_flash_sale_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
       CREATE TABLE IF NOT EXISTS banners (
         id TEXT PRIMARY KEY, title_json TEXT NOT NULL, bg_token TEXT NOT NULL DEFAULT 'graphite',
@@ -404,6 +431,29 @@ class SqlitePreviewClient implements DbClient {
       CREATE TABLE IF NOT EXISTS error_log (
         id TEXT PRIMARY KEY, route TEXT NOT NULL, message TEXT NOT NULL, stack TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
+      CREATE TABLE IF NOT EXISTS customer_segments (
+        id TEXT PRIMARY KEY, name_json TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+        rules_json TEXT NOT NULL, cached_member_count INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS email_campaigns (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, subject_json TEXT NOT NULL, preview_text_json TEXT NOT NULL,
+        segment_id TEXT, blocks_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft',
+        scheduled_at TEXT, sent_count INTEGER NOT NULL DEFAULT 0, failed_count INTEGER NOT NULL DEFAULT 0,
+        unsubscribed_count INTEGER NOT NULL DEFAULT 0, sent_at TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS automation_flows (
+        id TEXT PRIMARY KEY, name_json TEXT NOT NULL, trigger_type TEXT NOT NULL,
+        delay_hours INTEGER NOT NULL DEFAULT 0, subject_json TEXT NOT NULL, blocks_json TEXT NOT NULL,
+        attach_coupon_code TEXT, active INTEGER NOT NULL DEFAULT 1,
+        total_triggered INTEGER NOT NULL DEFAULT 0, total_sent INTEGER NOT NULL DEFAULT 0,
+        last_run_at TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS automation_executions (
+        id TEXT PRIMARY KEY, flow_id TEXT NOT NULL, dedup_key TEXT NOT NULL,
+        recipient_email TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(flow_id, dedup_key)
+      );
     `);
 
     const ensureCol = (table: string, col: string, defSql: string) => {
@@ -429,6 +479,18 @@ class SqlitePreviewClient implements DbClient {
     ensureCol('banners', 'device_target', "TEXT NOT NULL DEFAULT 'all'");
     ensureCol('banners', 'category_slug', 'TEXT');
     ensureCol('banners', 'bot_filtered_count', 'INTEGER NOT NULL DEFAULT 0');
+    ensureCol('coupons', 'max_discount_usd_cents', 'INTEGER');
+    ensureCol('coupons', 'target_type', "TEXT NOT NULL DEFAULT 'all'");
+    ensureCol('coupons', 'target_id', 'TEXT');
+    ensureCol('coupons', 'campaign_id', 'TEXT');
+    ensureCol('coupons', 'first_order_only', 'INTEGER NOT NULL DEFAULT 0');
+    ensureCol('coupons', 'auto_generated_batch', 'TEXT');
+    ensureCol('offers', 'stacking_rule', "TEXT NOT NULL DEFAULT 'best_only'");
+    ensureCol('offers', 'funding_source', "TEXT NOT NULL DEFAULT 'platform'");
+    ensureCol('offers', 'funding_platform_bps', 'INTEGER NOT NULL DEFAULT 10000');
+    ensureCol('offers', 'campaign_id', 'TEXT');
+    ensureCol('offers', 'priority', 'INTEGER NOT NULL DEFAULT 10');
+    ensureCol('offers', 'rules_json', 'TEXT');
   }
 
   private getDb() {

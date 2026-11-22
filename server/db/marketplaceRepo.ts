@@ -1,17 +1,34 @@
 import crypto from 'node:crypto';
 import type {
+  AttributeItem,
   AuditLogEntry,
+  AutomationFlow,
+  AutomationTriggerType,
   BannerBgToken,
   BannerPageScope,
   BannerPlacementType,
+  BrandItem,
+  Campaign,
+  CampaignStatus,
   Category,
   Coupon,
+  CouponDiscountType,
+  CustomerAddress,
+  CustomerSegment,
+  CustomerSegmentRule,
   DeliveryMode,
   DeliveryZone,
   DeviceTargetType,
+  EmailBlock,
+  EmailCampaign,
+  EmailCampaignStatus,
+  EmailTemplateItem,
   FeaturedPlacement,
   FeaturedPlacementTargetType,
   FeaturedSlotKey,
+  FlashSale,
+  FlashSaleItem,
+  FlashSaleStatus,
   HomeMigrationReport,
   HomePageSnapshot,
   HomeSection,
@@ -25,14 +42,23 @@ import type {
   LedgerEntry,
   LocalizedText,
   MarketingAudienceType,
+  MarketingAnalyticsSummary,
   MarketingPopup,
   MediaAsset,
+  MenuConfig,
+  NewsletterSubscriber,
+  NotificationItem,
   Offer,
   OfferApprovalStatus,
   OfferBanner,
+  OfferConflict,
+  OfferFundingSource,
+  OfferRulesConfig,
+  OfferStackingRule,
   OfferTargetType,
   OfferType,
   Order,
+  OrderDispute,
   OrderItem,
   PageContent,
   PaymentConfig,
@@ -46,15 +72,22 @@ import type {
   Product,
   ProductSpec,
   ProductVariant,
+  ReturnRequest,
   Review,
+  SegmentContact,
   Seller,
+  SellerDocumentReview,
+  SellerPromoRules,
+  SellerStaffMember,
   SellerStatus,
   SiteChromeSettings,
+  StockMovementItem,
   StorefrontThemeId,
   SubOrder,
   SubOrderStatus,
   SubscriptionPlan,
   SubscriptionTier,
+  SupportTicket,
 } from '../../src/shared/types.ts';
 import {
   DEFAULT_SITE_CHROME,
@@ -62,7 +95,7 @@ import {
   mapLegacySectionType,
   normalizeTargeting,
 } from '../../src/shared/homeSections.ts';
-import { isWithinSchedule, resolveUnitOfferPrice } from '../../src/shared/offers.ts';
+import { evaluateCartPromotions, isWithinSchedule, resolveUnitOfferPrice } from '../../src/shared/offers.ts';
 import type { DbClient, DbTx } from './client.ts';
 import { getPaymentAdapter, isCardGatewayConfigured } from '../paymentAdapters.ts';
 import { parseNaturalQuery } from '../searchParser.ts';
@@ -79,8 +112,8 @@ import {
   writeAuditLog,
   type AuthContextUser,
 } from '../services/security.ts';
-import { queueEmail } from '../services/email.ts';
-import { releaseEligibleEscrowHolds } from '../services/jobs.ts';
+import { queueEmail, type MarketingEmailJobPayload } from '../services/email.ts';
+import { enqueueJob, releaseEligibleEscrowHolds } from '../services/jobs.ts';
 
 function parseJson<T>(val: unknown, fallback: T): T {
   if (val === null || val === undefined) return fallback;
@@ -500,6 +533,11 @@ export class MarketplaceRepo {
       announcement: row.announcement_json ? parseJson<LocalizedText | null>(row.announcement_json, null) : null,
       bannerImage: bannerMedia?.public_url || '/src/assets/images/hero_beirut_editorial_1795297173320.jpg',
       logoImage: logoMedia?.public_url || null,
+      returnPolicy: row.return_policy_json ? parseJson<LocalizedText | null>(row.return_policy_json, null) : null,
+      processingHours: row.processing_hours !== null && row.processing_hours !== undefined ? Number(row.processing_hours) : 24,
+      vacationMode: Boolean(row.vacation_mode),
+      seoTitle: row.seo_title ? String(row.seo_title) : null,
+      seoDescription: row.seo_description ? String(row.seo_description) : null,
       createdAt: String(row.created_at),
     };
   }
@@ -528,6 +566,7 @@ export class MarketplaceRepo {
         slug: String(r.slug),
         sellerId: String(r.seller_id),
         categoryId: String(r.category_id),
+        brandId: r.brand_id ? String(r.brand_id) : null,
         department: String(r.department) as Product['department'],
         title: parseJson<LocalizedText>(r.title_json, { en: '', ar: '' }),
         subtitle: parseJson<LocalizedText>(r.subtitle_json, { en: '', ar: '' }),
@@ -564,7 +603,7 @@ export class MarketplaceRepo {
     const rows = await this.db.query<Record<string, unknown>>(
       `SELECT sel.*, st.slug, st.name_json, st.tagline_json, st.about_json, st.announcement_json,
               st.department_slug, st.theme_id, st.logo_media_id, st.banner_media_id, st.rating_avg_x10, st.review_count,
-              ss.delivery_mode, ss.self_delivery_fees_json
+              ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.return_policy_json, ss.seo_title, ss.seo_description
        FROM sellers sel
        INNER JOIN stores st ON st.seller_id = sel.id
        LEFT JOIN store_settings ss ON ss.store_id = st.id
@@ -580,7 +619,7 @@ export class MarketplaceRepo {
     const row = await this.db.queryOne<Record<string, unknown>>(
       `SELECT sel.*, st.slug, st.name_json, st.tagline_json, st.about_json, st.announcement_json,
               st.department_slug, st.theme_id, st.logo_media_id, st.banner_media_id, st.rating_avg_x10, st.review_count,
-              ss.delivery_mode, ss.self_delivery_fees_json
+              ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.return_policy_json, ss.seo_title, ss.seo_description
        FROM sellers sel
        INNER JOIN stores st ON st.seller_id = sel.id
        LEFT JOIN store_settings ss ON ss.store_id = st.id
@@ -594,7 +633,7 @@ export class MarketplaceRepo {
     const row = await this.db.queryOne<Record<string, unknown>>(
       `SELECT sel.*, st.slug, st.name_json, st.tagline_json, st.about_json, st.announcement_json,
               st.department_slug, st.theme_id, st.logo_media_id, st.banner_media_id, st.rating_avg_x10, st.review_count,
-              ss.delivery_mode, ss.self_delivery_fees_json
+              ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.return_policy_json, ss.seo_title, ss.seo_description
        FROM sellers sel
        INNER JOIN stores st ON st.seller_id = sel.id
        LEFT JOIN store_settings ss ON ss.store_id = st.id
@@ -609,7 +648,7 @@ export class MarketplaceRepo {
       `SELECT p.*
        FROM products p
        INNER JOIN sellers sel ON sel.id = p.seller_id
-       WHERE p.published = 1 AND p.deleted_at IS NULL AND sel.status = 'approved' AND sel.deleted_at IS NULL
+       WHERE p.published = 1 AND p.moderation_status = 'approved' AND p.deleted_at IS NULL AND sel.status = 'approved' AND sel.deleted_at IS NULL
        ORDER BY p.created_at DESC`
     );
     return this.mapProductRows(rows);
@@ -682,7 +721,7 @@ export class MarketplaceRepo {
     const row = await this.db.queryOne<Record<string, unknown>>(
       `SELECT p.* FROM products p
        INNER JOIN sellers sel ON sel.id = p.seller_id
-       WHERE (p.slug = ? OR p.id = ?) AND p.published = 1 AND p.deleted_at IS NULL AND sel.status = 'approved'
+       WHERE (p.slug = ? OR p.id = ?) AND p.published = 1 AND p.moderation_status = 'approved' AND p.deleted_at IS NULL AND sel.status = 'approved'
        LIMIT 1`,
       [slugOrId, slugOrId]
     );
@@ -697,7 +736,7 @@ export class MarketplaceRepo {
     const seller = await this.getSellerBySlug(slug);
     if (!seller || seller.status !== 'approved') return null;
     const rows = await this.db.query<Record<string, unknown>>(
-      'SELECT * FROM products WHERE seller_id = ? AND published = 1 AND deleted_at IS NULL ORDER BY created_at DESC',
+      "SELECT * FROM products WHERE seller_id = ? AND published = 1 AND moderation_status = 'approved' AND deleted_at IS NULL ORDER BY created_at DESC",
       [seller.id]
     );
     const products = await this.mapProductRows(rows);
@@ -786,6 +825,8 @@ export class MarketplaceRepo {
       settings,
       paymentsConfig,
       categories,
+      brands,
+      attributes,
       sellers,
       products,
       subscriptionPlans,
@@ -795,11 +836,15 @@ export class MarketplaceRepo {
       popups,
       featuredPlacements,
       offers,
+      flashSales,
+      campaigns,
       siteChrome,
     ] = await Promise.all([
       this.getPlatformSettings(),
       this.getPaymentConfig(),
       this.getCategories(),
+      this.getBrands(),
+      this.getAttributes(),
       this.getPublicSellers(),
       this.getPublicProducts(),
       this.getSubscriptionPlans(),
@@ -809,6 +854,8 @@ export class MarketplaceRepo {
       this.getActivePopups(),
       this.getActiveFeaturedPlacements(),
       this.getActiveOffers(),
+      this.getActiveFlashSales(),
+      this.getActiveCampaigns(),
       this.getSiteChrome(Boolean(ctx?.includeDrafts)),
     ]);
 
@@ -816,6 +863,8 @@ export class MarketplaceRepo {
       settings,
       paymentsConfig,
       categories,
+      brands,
+      attributes,
       sellers,
       products,
       subscriptionPlans,
@@ -825,6 +874,8 @@ export class MarketplaceRepo {
       popups,
       featuredPlacements,
       offers,
+      flashSales,
+      campaigns,
       siteChrome,
     };
   }
@@ -956,39 +1007,92 @@ export class MarketplaceRepo {
     return { bps: Number(plat.defaultCommissionBps), source: 'platform_default' };
   }
 
-  async validateCoupon(code: string, subtotalUsdCents: number, sellerIds: string[]) {
-    const clean = code.trim().toUpperCase();
-    const row = await this.db.queryOne<{
-      id: string;
-      code: string;
-      seller_id: string | null;
-      discount_type: string;
-      discount_value: number;
-      min_order_usd_cents: number;
-      max_uses: number | null;
-      used_count: number;
-      active: number | boolean;
-    }>('SELECT * FROM coupons WHERE UPPER(code) = ? AND active = 1 LIMIT 1', [clean]);
-
-    if (!row) throw new Error('Invalid or expired coupon code.');
-    if (row.max_uses !== null && Number(row.used_count) >= Number(row.max_uses)) {
-      throw new Error('This coupon has reached its redemption limit.');
-    }
-    if (subtotalUsdCents < Number(row.min_order_usd_cents)) {
-      throw new Error(`Minimum order for ${row.code} is $${(Number(row.min_order_usd_cents) / 100).toFixed(2)}.`);
-    }
-    if (row.seller_id && !sellerIds.includes(row.seller_id)) {
-      throw new Error(`Coupon ${row.code} applies only to items from its issuing store.`);
-    }
-
+  private mapCouponRow(row: Record<string, unknown>): Coupon {
+    const dType = String(row.discount_type || 'percent') as CouponDiscountType;
+    const dVal = Number(row.discount_value ?? 0);
     return {
-      id: row.id,
-      code: row.code,
-      sellerId: row.seller_id,
-      discountPercent: Number(row.discount_value),
-      minOrderUsdCents: Number(row.min_order_usd_cents),
+      id: String(row.id),
+      code: String(row.code),
+      sellerId: row.seller_id ? String(row.seller_id) : null,
+      discountType: dType,
+      discountValue: dVal,
+      discountPercent: dType === 'percent' ? dVal : 0,
+      maxDiscountUsdCents: row.max_discount_usd_cents !== null && row.max_discount_usd_cents !== undefined ? Number(row.max_discount_usd_cents) : null,
+      minOrderUsdCents: Number(row.min_order_usd_cents ?? 0),
+      targetType: String(row.target_type || 'all') as OfferTargetType,
+      targetId: row.target_id ? String(row.target_id) : null,
+      campaignId: row.campaign_id ? String(row.campaign_id) : null,
+      maxUses: row.max_uses !== null && row.max_uses !== undefined ? Number(row.max_uses) : null,
+      perCustomerLimit: Number(row.per_customer_limit ?? 1),
+      usedCount: Number(row.used_count ?? 0),
+      firstOrderOnly: Boolean(row.first_order_only),
+      autoGeneratedBatch: row.auto_generated_batch ? String(row.auto_generated_batch) : null,
+      startsAt: row.starts_at ? String(row.starts_at) : null,
+      endsAt: row.ends_at ? String(row.ends_at) : null,
       active: Boolean(row.active),
     };
+  }
+
+  async validateCoupon(
+    code: string,
+    subtotalUsdCents: number,
+    sellerIds: string[],
+    opts?: { userId?: string | null; customerPhone?: string | null; tx?: DbTx }
+  ): Promise<Coupon> {
+    const db = opts?.tx || this.db;
+    const clean = code.trim().toUpperCase();
+    const row = await db.queryOne<Record<string, unknown>>(
+      'SELECT * FROM coupons WHERE UPPER(code) = ? AND active = 1 LIMIT 1',
+      [clean]
+    );
+
+    if (!row) throw new Error('Invalid or expired coupon code.');
+    const coupon = this.mapCouponRow(row);
+
+    if (!isWithinSchedule(coupon.startsAt, coupon.endsAt)) {
+      throw new Error('This coupon is outside its active schedule window.');
+    }
+    if (coupon.maxUses !== null && coupon.maxUses !== undefined && coupon.usedCount >= coupon.maxUses) {
+      throw new Error('This coupon has reached its redemption limit.');
+    }
+    if (subtotalUsdCents < coupon.minOrderUsdCents) {
+      throw new Error(`Minimum order for ${coupon.code} is $${(coupon.minOrderUsdCents / 100).toFixed(2)}.`);
+    }
+    if (coupon.sellerId && !sellerIds.includes(coupon.sellerId)) {
+      throw new Error(`Coupon ${coupon.code} applies only to items from its issuing store.`);
+    }
+
+    const phoneNorm = opts?.customerPhone ? normalizePhone(opts.customerPhone) : '';
+    if (coupon.perCustomerLimit > 0 && (opts?.userId || phoneNorm.length >= 6)) {
+      const clauses: string[] = [];
+      const params: unknown[] = [coupon.id];
+      if (opts?.userId) {
+        clauses.push('user_id = ?');
+        params.push(opts.userId);
+      }
+      if (phoneNorm.length >= 6) {
+        clauses.push('customer_phone_norm = ?');
+        params.push(phoneNorm);
+      }
+      const red = await db.queryOne<{ cnt: number }>(
+        `SELECT COUNT(*) AS cnt FROM coupon_redemptions WHERE coupon_id = ? AND (${clauses.join(' OR ')})`,
+        params
+      );
+      if (Number(red?.cnt ?? 0) >= coupon.perCustomerLimit) {
+        throw new Error(`Coupon ${coupon.code} usage limit reached for your account.`);
+      }
+    }
+
+    if (coupon.firstOrderOnly && (opts?.userId || phoneNorm.length >= 6)) {
+      const existingOrd = opts?.userId
+        ? await db.queryOne<{ id: string }>('SELECT id FROM orders WHERE user_id = ? LIMIT 1', [opts.userId])
+        : await db.queryOne<{ id: string }>('SELECT id FROM orders WHERE customer_phone LIKE ? LIMIT 1', [`%${phoneNorm}`]);
+      if (existingOrd) {
+        throw new Error(`Coupon ${coupon.code} is valid for first-time orders only.`);
+      }
+    }
+
+    return coupon;
   }
 
   async createOrder(
@@ -1019,27 +1123,30 @@ export class MarketplaceRepo {
     }
 
     const orderNumber = `NL-${new Date().getFullYear()}-${String(crypto.randomInt(100000, 999999))}`;
+    const phoneNorm = normalizePhone(input.customerPhone);
 
     return this.db.transaction(async (tx) => {
-      const activeOffers = await this.getActiveOffers(tx);
-      const grouped = new Map<
-        string,
-        {
-          seller: Seller;
-          items: Array<{
-            product: Product;
-            variant: ProductVariant;
-            quantity: number;
-            unitPrice: number;
-            lineTotal: number;
-            commBps: number;
-            commSource: string;
-            commCents: number;
-          }>;
-        }
-      >();
+      const [activeOffers, activeFlashSales] = await Promise.all([
+        this.getActiveOffers(tx),
+        this.getActiveFlashSales(tx),
+      ]);
 
-      let subtotalUsdCents = 0;
+      let isFirstOrder = true;
+      if (input.userId) {
+        const prior = await tx.queryOne<{ id: string }>('SELECT id FROM orders WHERE user_id = ? LIMIT 1', [input.userId]);
+        isFirstOrder = !prior;
+      } else if (phoneNorm.length >= 6) {
+        const prior = await tx.queryOne<{ id: string }>('SELECT id FROM orders WHERE customer_phone LIKE ? LIMIT 1', [`%${phoneNorm}`]);
+        isFirstOrder = !prior;
+      }
+
+      const resolvedCartLines: Array<{
+        product: Product;
+        variant: ProductVariant;
+        seller: Seller;
+        quantity: number;
+        baseUnitUsdCents: number;
+      }> = [];
 
       for (const reqItem of input.items) {
         if (reqItem.quantity < 1) throw new Error('Invalid item quantity.');
@@ -1060,7 +1167,6 @@ export class MarketplaceRepo {
           throw new Error('Merchant storefront is currently unavailable.');
         }
 
-        // Atomic stock deduction + stock_movements log
         const stockRes = await tx.execute(
           'UPDATE product_variants SET stock = stock - ? WHERE id = ? AND stock >= ?',
           [reqItem.quantity, variant.id, reqItem.quantity]
@@ -1073,30 +1179,88 @@ export class MarketplaceRepo {
           [`stk-${crypto.randomUUID()}`, variant.id, -reqItem.quantity, 'order_reserved', orderNumber, toSqlTimestamp()]
         );
 
-        const baseUnit = product.basePriceUsdCents + variant.priceDeltaUsdCents;
-        const unitPrice = resolveUnitOfferPrice(baseUnit, product, activeOffers).effectiveUsdCents;
-        const lineTotal = unitPrice * reqItem.quantity;
-        const comm = await this.resolveCommissionBps(seller.id, product.categoryId, tx);
-        const commCents = Math.round((lineTotal * comm.bps) / 10000);
+        const baseUnitUsdCents = product.basePriceUsdCents + variant.priceDeltaUsdCents;
+        resolvedCartLines.push({ product, variant, seller, quantity: reqItem.quantity, baseUnitUsdCents });
+      }
+
+      const promoEval = evaluateCartPromotions(
+        resolvedCartLines.map((l) => ({
+          product: l.product,
+          baseUnitUsdCents: l.baseUnitUsdCents,
+          quantity: l.quantity,
+        })),
+        activeOffers,
+        activeFlashSales,
+        { isLoggedIn: Boolean(input.userId), isFirstOrder }
+      );
+
+      // Claim flash sale stock caps atomically
+      for (let i = 0; i < promoEval.lines.length; i++) {
+        const evalLine = promoEval.lines[i];
+        const rawLine = resolvedCartLines[i];
+        if (evalLine.appliedFlashItemId) {
+          const claimRes = await tx.execute(
+            'UPDATE flash_sale_items SET claimed_count = claimed_count + ? WHERE id = ? AND (stock_cap = 0 OR claimed_count + ? <= stock_cap)',
+            [rawLine.quantity, evalLine.appliedFlashItemId, rawLine.quantity]
+          );
+          if (claimRes.affectedRows === 0) {
+            throw new Error(`Flash deal stock cap reached for ${rawLine.product.title.en}; remove item or retry.`);
+          }
+        }
+      }
+
+      const grouped = new Map<
+        string,
+        {
+          seller: Seller;
+          items: Array<{
+            product: Product;
+            variant: ProductVariant;
+            quantity: number;
+            unitPrice: number;
+            lineTotal: number;
+            extraOfferDiscountUsdCents: number;
+            commBps: number;
+            commSource: string;
+            commCents: number;
+          }>;
+        }
+      >();
+
+      let subtotalUsdCents = 0;
+      for (let i = 0; i < resolvedCartLines.length; i++) {
+        const raw = resolvedCartLines[i];
+        const ev = promoEval.lines[i];
+        const unitPrice = ev.effectiveUnitUsdCents;
+        const lineTotal = ev.lineSubtotalUsdCents;
+        const netLineTotal = Math.max(1, lineTotal - ev.extraLineDiscountUsdCents);
+        const comm = await this.resolveCommissionBps(raw.seller.id, raw.product.categoryId, tx);
+        const commCents = Math.round((netLineTotal * comm.bps) / 10000);
         subtotalUsdCents += lineTotal;
 
-        const bucket = grouped.get(seller.id) || { seller, items: [] };
+        const bucket = grouped.get(raw.seller.id) || { seller: raw.seller, items: [] };
         bucket.items.push({
-          product,
-          variant,
-          quantity: reqItem.quantity,
+          product: raw.product,
+          variant: raw.variant,
+          quantity: raw.quantity,
           unitPrice,
           lineTotal,
+          extraOfferDiscountUsdCents: ev.extraLineDiscountUsdCents,
           commBps: comm.bps,
           commSource: comm.source,
           commCents,
         });
-        grouped.set(seller.id, bucket);
+        grouped.set(raw.seller.id, bucket);
       }
 
-      let couponRecord: { id: string; code: string; sellerId: string | null; discountPercent: number } | null = null;
+      let couponRecord: Coupon | null = null;
       if (input.couponCode && input.couponCode.trim()) {
-        const c = await this.validateCoupon(input.couponCode, subtotalUsdCents, Array.from(grouped.keys()));
+        const c = await this.validateCoupon(
+          input.couponCode,
+          subtotalUsdCents - promoEval.extraOfferDiscountUsdCents,
+          Array.from(grouped.keys()),
+          { userId: input.userId, customerPhone: input.customerPhone, tx }
+        );
         couponRecord = c;
         await tx.execute('UPDATE coupons SET used_count = used_count + 1 WHERE id = ?', [c.id]);
       }
@@ -1106,25 +1270,64 @@ export class MarketplaceRepo {
         [input.governorate]
       );
       const platformZoneFee = Number(zoneRow?.platform_fee_usd_cents ?? 500);
+      const waiveShipping = promoEval.freeShippingApplied || couponRecord?.discountType === 'free_shipping';
 
       let deliveryTotalUsdCents = 0;
       let discountTotalUsdCents = 0;
+      let couponTotalUsedUsdCents = 0;
       const orderId = `ord-${crypto.randomUUID()}`;
       const createdAt = toSqlTimestamp();
       const builtSubOrders: SubOrder[] = [];
 
-      for (const [sellerId, bucket] of grouped.entries()) {
-        const subSubtotal = bucket.items.reduce((s, i) => s + i.lineTotal, 0);
-        const subComm = bucket.items.reduce((s, i) => s + i.commCents, 0);
-        const subDiscount =
-          couponRecord && (!couponRecord.sellerId || couponRecord.sellerId === sellerId)
-            ? Math.round((subSubtotal * couponRecord.discountPercent) / 100)
-            : 0;
+      const matchingSubOrderEntries = Array.from(grouped.entries());
+      const couponTargetSubtotal = matchingSubOrderEntries.reduce((sum, [sid, b]) => {
+        if (couponRecord?.sellerId && couponRecord.sellerId !== sid) return sum;
+        return sum + b.items.reduce((s, i) => s + (i.lineTotal - i.extraOfferDiscountUsdCents), 0);
+      }, 0);
 
-        const deliveryFee =
+      let fixedCouponBudget = 0;
+      if (couponRecord && couponTargetSubtotal > 0) {
+        if (couponRecord.discountType === 'fixed_usd_cents') {
+          fixedCouponBudget = Math.min(couponTargetSubtotal - 1, Math.max(0, couponRecord.discountValue));
+        } else if (couponRecord.discountType === 'percent') {
+          fixedCouponBudget = Math.round((couponTargetSubtotal * couponRecord.discountValue) / 100);
+        }
+        if (couponRecord.maxDiscountUsdCents && fixedCouponBudget > couponRecord.maxDiscountUsdCents) {
+          fixedCouponBudget = couponRecord.maxDiscountUsdCents;
+        }
+      }
+
+      let distributedCoupon = 0;
+      const eligibleCouponSellers = matchingSubOrderEntries.filter(
+        ([sid]) => !couponRecord?.sellerId || couponRecord.sellerId === sid
+      );
+
+      for (const [sellerId, bucket] of matchingSubOrderEntries) {
+        const subSubtotal = bucket.items.reduce((s, i) => s + i.lineTotal, 0);
+        const subPromoDiscount = bucket.items.reduce((s, i) => s + i.extraOfferDiscountUsdCents, 0);
+        const subComm = bucket.items.reduce((s, i) => s + i.commCents, 0);
+
+        let subCouponDiscount = 0;
+        if (couponRecord && fixedCouponBudget > 0 && (!couponRecord.sellerId || couponRecord.sellerId === sellerId)) {
+          const netSub = Math.max(0, subSubtotal - subPromoDiscount);
+          const idxInEligible = eligibleCouponSellers.findIndex(([esid]) => esid === sellerId);
+          if (idxInEligible === eligibleCouponSellers.length - 1) {
+            subCouponDiscount = Math.max(0, fixedCouponBudget - distributedCoupon);
+          } else if (couponTargetSubtotal > 0) {
+            subCouponDiscount = Math.round((fixedCouponBudget * netSub) / couponTargetSubtotal);
+          }
+          subCouponDiscount = Math.min(netSub, subCouponDiscount);
+          distributedCoupon += subCouponDiscount;
+        }
+
+        const subDiscount = subPromoDiscount + subCouponDiscount;
+        couponTotalUsedUsdCents += subCouponDiscount;
+
+        const baseDeliveryFee =
           bucket.seller.deliveryMode === 'self'
             ? Number(bucket.seller.selfDeliveryFeesUsdCents[input.governorate] ?? platformZoneFee)
             : platformZoneFee;
+        const deliveryFee = waiveShipping ? 0 : baseDeliveryFee;
 
         deliveryTotalUsdCents += deliveryFee;
         discountTotalUsdCents += subDiscount;
@@ -1191,7 +1394,6 @@ export class MarketplaceRepo {
           });
         }
 
-        // Double-entry ledger entries (held until delivery + holdPeriodDays)
         await tx.execute(
           `INSERT INTO ledger_entries (id, seller_id, sub_order_id, order_number, entry_type, direction, amount_usd_cents, availability, note, created_at)
            VALUES (?, ?, ?, ?, 'ORDER_GROSS', 'credit', ?, 'pending', ?, ?)`,
@@ -1226,6 +1428,14 @@ export class MarketplaceRepo {
           items: orderItemsOut,
           updatedAt: createdAt,
         });
+      }
+
+      if (couponRecord) {
+        await tx.execute(
+          `INSERT INTO coupon_redemptions (id, coupon_id, user_id, customer_phone_norm, order_id, discount_usd_cents, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [`cred-${crypto.randomUUID()}`, couponRecord.id, input.userId, phoneNorm || 'guest', orderId, couponTotalUsedUsdCents, createdAt]
+        );
       }
 
       const codFeeUsdCents = input.paymentMethod === 'cod' ? Number(settings.codFeeUsdCents) : 0;
@@ -1272,6 +1482,29 @@ export class MarketplaceRepo {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         [`pay-${crypto.randomUUID()}`, orderId, input.paymentMethod, payRes.gatewayName, payRes.reference, grandTotalUsdCents, payRes.paymentStatus, createdAt]
       );
+
+      if (input.userId) {
+        await this.createNotification(
+          tx,
+          input.userId,
+          { en: `Order ${orderNumber} placed`, ar: `تم استلام الطلب ${orderNumber}` },
+          {
+            en: `Your order totaling $${(grandTotalUsdCents / 100).toFixed(2)} is confirmed.`,
+            ar: `تم تأكيد طلبك بقيمة ${(grandTotalUsdCents / 100).toFixed(2)} دولار.`,
+          }
+        );
+      }
+      for (const [, bucket] of matchingSubOrderEntries) {
+        await this.createNotification(
+          tx,
+          bucket.seller.userId,
+          { en: `New order ${orderNumber}`, ar: `طلب جديد ${orderNumber}` },
+          {
+            en: `${bucket.items.length} item(s) ordered from ${bucket.seller.name.en}.`,
+            ar: `تم طلب ${bucket.items.length} منتج من متجرك ${bucket.seller.name.ar}.`,
+          }
+        );
+      }
 
       await writeAuditLog(tx, {
         actorUserId: input.userId,
@@ -1586,7 +1819,7 @@ export class MarketplaceRepo {
         (await tx.queryOne<Record<string, unknown>>(
           `SELECT sel.*, st.slug, st.name_json, st.tagline_json, st.about_json, st.announcement_json,
                   st.department_slug, st.theme_id, st.logo_media_id, st.banner_media_id, st.rating_avg_x10, st.review_count,
-                  ss.delivery_mode, ss.self_delivery_fees_json
+                  ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.return_policy_json, ss.seo_title, ss.seo_description
            FROM sellers sel INNER JOIN stores st ON st.seller_id = sel.id LEFT JOIN store_settings ss ON ss.store_id = st.id
            WHERE sel.id = ?`,
           [sellerId]
@@ -1754,23 +1987,18 @@ export class MarketplaceRepo {
     }));
 
     const couponRows = await this.db.query<Record<string, unknown>>('SELECT * FROM coupons WHERE seller_id = ?', [sellerId]);
-    const coupons: Coupon[] = couponRows.map((c) => ({
-      id: String(c.id),
-      code: String(c.code),
-      sellerId: c.seller_id ? String(c.seller_id) : null,
-      discountPercent: Number(c.discount_value),
-      minOrderUsdCents: Number(c.min_order_usd_cents),
-      active: Boolean(c.active),
-    }));
+    const coupons: Coupon[] = couponRows.map((c) => this.mapCouponRow(c));
 
     const docs = await this.db.query<{
       id: string;
       doc_type: string;
+      media_id: string;
       review_status: string;
+      reviewer_note: string | null;
       public_url: string;
       created_at: string;
     }>(
-      `SELECT d.id, d.doc_type, d.review_status, m.public_url, d.created_at
+      `SELECT d.id, d.doc_type, d.media_id, d.review_status, d.reviewer_note, m.public_url, d.created_at
        FROM seller_documents d INNER JOIN media m ON m.id = d.media_id
        WHERE d.seller_id = ? ORDER BY d.created_at DESC`,
       [sellerId]
@@ -1779,10 +2007,99 @@ export class MarketplaceRepo {
     const reviews = await this.getReviewsForSeller(sellerId);
     const catId = `cat-${seller.department === 'home-gadgets' ? 'home' : seller.department}`;
     const commissionInfo = await this.resolveCommissionBps(seller.id, catId);
-    const [subscriptionPlans, deliveryZones, sellerOffers] = await Promise.all([
+
+    const stockMovementRows = await this.db.query<{
+      id: string;
+      variant_id: string;
+      sku: string;
+      title_json: string;
+      delta: number;
+      reason: string;
+      reference_id: string | null;
+      created_at: string;
+    }>(
+      `SELECT sm.id, sm.variant_id, pv.sku, p.title_json, sm.delta, sm.reason, sm.reference_id, sm.created_at
+       FROM stock_movements sm
+       INNER JOIN product_variants pv ON pv.id = sm.variant_id
+       INNER JOIN products p ON p.id = pv.product_id
+       WHERE p.seller_id = ?
+       ORDER BY sm.created_at DESC
+       LIMIT 60`,
+      [sellerId]
+    );
+    const stockMovements: StockMovementItem[] = stockMovementRows.map((sm) => ({
+      id: sm.id,
+      variantId: sm.variant_id,
+      sku: sm.sku,
+      productTitle: parseJson<LocalizedText>(sm.title_json, { en: sm.sku, ar: sm.sku }),
+      delta: Number(sm.delta),
+      reason: sm.reason,
+      referenceId: sm.reference_id,
+      createdAt: String(sm.created_at),
+    }));
+
+    const returnRows = await this.db.query<Record<string, unknown>>(
+      `SELECT r.*, o.order_number, so.seller_id
+       FROM returns r
+       INNER JOIN sub_orders so ON so.id = r.sub_order_id
+       INNER JOIN orders o ON o.id = so.order_id
+       WHERE so.seller_id = ?
+       ORDER BY r.created_at DESC`,
+      [sellerId]
+    );
+    const returnsList: ReturnRequest[] = returnRows.map((r) => ({
+      id: String(r.id),
+      subOrderId: String(r.sub_order_id),
+      userId: String(r.user_id),
+      reason: String(r.reason),
+      status: String(r.status) as ReturnRequest['status'],
+      refundUsdCents: Number(r.refund_usd_cents || 0),
+      createdAt: String(r.created_at),
+      orderNumber: r.order_number ? String(r.order_number) : undefined,
+      sellerId: String(r.seller_id),
+    }));
+
+    const disputeRows = await this.db.query<Record<string, unknown>>(
+      `SELECT d.*, o.order_number, so.seller_id
+       FROM disputes d
+       INNER JOIN sub_orders so ON so.id = d.sub_order_id
+       INNER JOIN orders o ON o.id = so.order_id
+       WHERE so.seller_id = ?
+       ORDER BY d.created_at DESC`,
+      [sellerId]
+    );
+    const disputesList: OrderDispute[] = disputeRows.map((d) => ({
+      id: String(d.id),
+      subOrderId: String(d.sub_order_id),
+      openedByUserId: String(d.opened_by_user_id),
+      reason: String(d.reason),
+      status: String(d.status) as OrderDispute['status'],
+      resolutionNote: d.resolution_note ? String(d.resolution_note) : null,
+      createdAt: String(d.created_at),
+      orderNumber: d.order_number ? String(d.order_number) : undefined,
+      sellerId: String(d.seller_id),
+    }));
+
+    const [
+      subscriptionPlans,
+      deliveryZones,
+      sellerOffers,
+      sellerPromoRules,
+      categories,
+      brands,
+      attributes,
+      sellerStaff,
+      notifications,
+    ] = await Promise.all([
       this.getSubscriptionPlans(),
       this.getDeliveryZones(),
       this.sellerListOffers(sellerId),
+      this.getSellerPromoRules(),
+      this.getCategories(),
+      this.getBrands(),
+      this.getAttributes(),
+      this.listSellerStaff(sellerId),
+      this.getUserNotifications(seller.userId),
     ]);
 
     return {
@@ -1793,11 +2110,28 @@ export class MarketplaceRepo {
       payouts,
       coupons,
       offers: sellerOffers,
+      sellerPromoRules,
       reviews,
-      documents: docs,
+      documents: docs.map((d) => ({
+        id: d.id,
+        doc_type: d.doc_type,
+        media_id: d.media_id,
+        review_status: d.review_status,
+        reviewer_note: d.reviewer_note,
+        public_url: d.public_url,
+        created_at: String(d.created_at),
+      })),
       commissionInfo,
       subscriptionPlans,
       deliveryZones,
+      categories,
+      brands,
+      attributes,
+      stockMovements,
+      sellerStaff,
+      returns: returnsList,
+      disputes: disputesList,
+      notifications,
     };
   }
 
@@ -1809,22 +2143,37 @@ export class MarketplaceRepo {
       taglineAr?: string;
       aboutEn?: string;
       aboutAr?: string;
+      announcementEn?: string;
+      announcementAr?: string;
+      returnPolicyEn?: string;
+      returnPolicyAr?: string;
+      processingHours?: number;
+      vacationMode?: boolean;
+      seoTitle?: string;
+      seoDescription?: string;
       storefrontTheme?: StorefrontThemeId;
       deliveryMode?: DeliveryMode;
+      selfDeliveryFeesUsdCents?: Record<string, number>;
+      payoutMethod?: 'whish' | 'omt' | 'bank';
+      payoutAccount?: string;
+      whatsappPhone?: string;
       bannerMediaId?: string;
       logoMediaId?: string;
     },
     ipAddress?: string
   ) {
     return this.db.transaction(async (tx) => {
-      const storeRow = await tx.queryOne<{ id: string; tagline_json: string; about_json: string }>(
-        'SELECT id, tagline_json, about_json FROM stores WHERE seller_id = ?',
-        [sellerId]
-      );
+      const storeRow = await tx.queryOne<{
+        id: string;
+        tagline_json: string;
+        about_json: string;
+        announcement_json: string | null;
+      }>('SELECT id, tagline_json, about_json, announcement_json FROM stores WHERE seller_id = ?', [sellerId]);
       if (!storeRow) throw new Error('Store not found.');
 
       const currTagline = parseJson<LocalizedText>(storeRow.tagline_json, { en: '', ar: '' });
       const currAbout = parseJson<LocalizedText>(storeRow.about_json, { en: '', ar: '' });
+      const currAnn = storeRow.announcement_json ? parseJson<LocalizedText>(storeRow.announcement_json, { en: '', ar: '' }) : { en: '', ar: '' };
       const nextTagline = {
         en: patch.taglineEn !== undefined ? patch.taglineEn : currTagline.en,
         ar: patch.taglineAr !== undefined ? patch.taglineAr : currTagline.ar,
@@ -1833,9 +2182,17 @@ export class MarketplaceRepo {
         en: patch.aboutEn !== undefined ? patch.aboutEn : currAbout.en,
         ar: patch.aboutAr !== undefined ? patch.aboutAr : currAbout.ar,
       };
+      const hasAnnChange = patch.announcementEn !== undefined || patch.announcementAr !== undefined;
+      const nextAnn = hasAnnChange
+        ? {
+            en: patch.announcementEn !== undefined ? patch.announcementEn : currAnn.en,
+            ar: patch.announcementAr !== undefined ? patch.announcementAr : currAnn.ar,
+          }
+        : null;
 
       await tx.execute(
         `UPDATE stores SET tagline_json = ?, about_json = ?,
+         announcement_json = COALESCE(?, announcement_json),
          theme_id = COALESCE(?, theme_id),
          banner_media_id = COALESCE(?, banner_media_id),
          logo_media_id = COALESCE(?, logo_media_id),
@@ -1844,6 +2201,7 @@ export class MarketplaceRepo {
         [
           JSON.stringify(nextTagline),
           JSON.stringify(nextAbout),
+          nextAnn ? JSON.stringify(nextAnn) : null,
           patch.storefrontTheme || null,
           patch.bannerMediaId || null,
           patch.logoMediaId || null,
@@ -1852,11 +2210,64 @@ export class MarketplaceRepo {
         ]
       );
 
-      if (patch.deliveryMode) {
-        await tx.execute('UPDATE store_settings SET delivery_mode = ? WHERE store_id = ?', [
-          patch.deliveryMode,
+      const settingsRow = await tx.queryOne<{
+        delivery_mode: string;
+        self_delivery_fees_json: string;
+        processing_hours: number;
+        vacation_mode: number | boolean;
+        return_policy_json: string | null;
+        seo_title: string | null;
+        seo_description: string | null;
+      }>('SELECT * FROM store_settings WHERE store_id = ?', [storeRow.id]);
+
+      const currRet = settingsRow?.return_policy_json
+        ? parseJson<LocalizedText>(settingsRow.return_policy_json, { en: '', ar: '' })
+        : { en: '', ar: '' };
+      const nextRet =
+        patch.returnPolicyEn !== undefined || patch.returnPolicyAr !== undefined
+          ? {
+              en: patch.returnPolicyEn !== undefined ? patch.returnPolicyEn : currRet.en,
+              ar: patch.returnPolicyAr !== undefined ? patch.returnPolicyAr : currRet.ar,
+            }
+          : currRet;
+
+      const nextFees =
+        patch.selfDeliveryFeesUsdCents !== undefined
+          ? patch.selfDeliveryFeesUsdCents
+          : parseJson<Record<string, number>>(settingsRow?.self_delivery_fees_json, {});
+
+      await tx.execute(
+        `UPDATE store_settings
+         SET delivery_mode = ?, self_delivery_fees_json = ?, processing_hours = ?, vacation_mode = ?, return_policy_json = ?, seo_title = ?, seo_description = ?
+         WHERE store_id = ?`,
+        [
+          patch.deliveryMode || settingsRow?.delivery_mode || 'platform',
+          JSON.stringify(nextFees),
+          patch.processingHours !== undefined ? Math.max(1, Math.min(360, Math.trunc(patch.processingHours))) : Number(settingsRow?.processing_hours ?? 24),
+          patch.vacationMode !== undefined ? (patch.vacationMode ? 1 : 0) : settingsRow?.vacation_mode ? 1 : 0,
+          JSON.stringify(nextRet),
+          patch.seoTitle !== undefined ? patch.seoTitle.trim() || null : settingsRow?.seo_title ?? null,
+          patch.seoDescription !== undefined ? patch.seoDescription.trim() || null : settingsRow?.seo_description ?? null,
           storeRow.id,
-        ]);
+        ]
+      );
+
+      if (patch.payoutMethod || patch.payoutAccount !== undefined || patch.whatsappPhone !== undefined) {
+        await tx.execute(
+          `UPDATE sellers
+           SET payout_method = COALESCE(?, payout_method),
+               payout_account = COALESCE(?, payout_account),
+               whatsapp_phone = COALESCE(?, whatsapp_phone),
+               updated_at = ?
+           WHERE id = ?`,
+          [
+            patch.payoutMethod || null,
+            patch.payoutAccount !== undefined ? patch.payoutAccount.trim() : null,
+            patch.whatsappPhone !== undefined ? patch.whatsappPhone.trim() : null,
+            toSqlTimestamp(),
+            sellerId,
+          ]
+        );
       }
 
       await writeAuditLog(tx, {
@@ -1868,7 +2279,15 @@ export class MarketplaceRepo {
         ipAddress,
       });
 
-      return this.getSellerById(sellerId);
+      const updatedSellerRow = await tx.queryOne<Record<string, unknown>>(
+        `SELECT sel.*, st.slug, st.name_json, st.tagline_json, st.about_json, st.announcement_json,
+                st.department_slug, st.theme_id, st.logo_media_id, st.banner_media_id, st.rating_avg_x10, st.review_count,
+                ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.return_policy_json, ss.seo_title, ss.seo_description
+         FROM sellers sel INNER JOIN stores st ON st.seller_id = sel.id LEFT JOIN store_settings ss ON ss.store_id = st.id
+         WHERE sel.id = ? LIMIT 1`,
+        [sellerId]
+      );
+      return updatedSellerRow ? this.mapSellerRow(updatedSellerRow, tx) : null;
     });
   }
 
@@ -1885,11 +2304,16 @@ export class MarketplaceRepo {
       basePriceUsdCents: number;
       compareAtUsdCents?: number | null;
       department?: 'fashion' | 'electronics' | 'home-gadgets';
+      categoryId?: string;
+      brandId?: string | null;
+      specs?: ProductSpec[];
+      model3dUrl?: string | null;
       sku: string;
       size?: string;
       color?: string;
       colorHex?: string;
       stock: number;
+      variants?: Array<{ sku: string; size?: string; color?: string; colorHex?: string; stock: number; priceDeltaUsdCents?: number }>;
       mediaIds?: string[];
       published?: boolean;
     },
@@ -1917,43 +2341,71 @@ export class MarketplaceRepo {
       }
 
       const prodId = `prd-${crypto.randomUUID()}`;
-      const varId = `var-${crypto.randomUUID()}`;
       const slugBase = input.titleEn.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'item';
       const slug = `${slugBase}-${crypto.randomInt(1000, 9999)}`;
       const dept = input.department || seller.department;
-      const categoryId = `cat-${dept === 'home-gadgets' ? 'home' : dept}`;
+      const categoryId = input.categoryId?.trim() || `cat-${dept === 'home-gadgets' ? 'home' : dept}`;
       const now = toSqlTimestamp();
 
       await tx.execute(
-        `INSERT INTO products (id, seller_id, category_id, department, slug, title_json, subtitle_json, description_json, specs_json, base_price_usd_cents, compare_at_usd_cents, seller_currency, moderation_status, published, featured, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, 'USD', 'approved', ?, 0, ?, ?)`,
+        `INSERT INTO products (id, seller_id, category_id, brand_id, department, slug, title_json, subtitle_json, description_json, specs_json, base_price_usd_cents, compare_at_usd_cents, seller_currency, moderation_status, published, featured, model_3d_url, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'USD', 'approved', ?, 0, ?, ?, ?)`,
         [
           prodId,
           sellerId,
           categoryId,
+          input.brandId || null,
           dept,
           slug,
           JSON.stringify({ en: input.titleEn.trim(), ar: (input.titleAr || input.titleEn).trim() }),
           JSON.stringify({ en: (input.subtitleEn || '').trim(), ar: (input.subtitleAr || input.subtitleEn || '').trim() }),
           JSON.stringify({ en: (input.descriptionEn || input.titleEn).trim(), ar: (input.descriptionAr || input.titleAr || input.titleEn).trim() }),
+          JSON.stringify(input.specs || []),
           input.basePriceUsdCents,
           input.compareAtUsdCents || null,
           input.published === false ? 0 : 1,
+          input.model3dUrl?.trim() || null,
           now,
           now,
         ]
       );
 
-      await tx.execute(
-        `INSERT INTO product_variants (id, product_id, sku, size, color, color_hex, stock, price_delta_usd_cents)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
-        [varId, prodId, input.sku.trim(), input.size || null, input.color || 'Default', input.colorHex || '#1C1D21', Math.max(0, Math.trunc(input.stock))]
-      );
+      const variantsInput =
+        input.variants && input.variants.length > 0
+          ? input.variants
+          : [
+              {
+                sku: input.sku,
+                size: input.size,
+                color: input.color,
+                colorHex: input.colorHex,
+                stock: input.stock,
+                priceDeltaUsdCents: 0,
+              },
+            ];
 
-      await tx.execute(
-        'INSERT INTO stock_movements (id, variant_id, delta, reason, reference_id, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-        [`stk-${crypto.randomUUID()}`, varId, Math.max(0, Math.trunc(input.stock)), 'initial_stock', prodId, now]
-      );
+      for (const v of variantsInput) {
+        const varId = `var-${crypto.randomUUID()}`;
+        const vStock = Math.max(0, Math.trunc(v.stock));
+        await tx.execute(
+          `INSERT INTO product_variants (id, product_id, sku, size, color, color_hex, stock, price_delta_usd_cents)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            varId,
+            prodId,
+            v.sku.trim(),
+            v.size?.trim() || null,
+            (v.color || 'Default').trim(),
+            v.colorHex || '#1C1D21',
+            vStock,
+            Math.trunc(v.priceDeltaUsdCents || 0),
+          ]
+        );
+        await tx.execute(
+          'INSERT INTO stock_movements (id, variant_id, delta, reason, reference_id, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+          [`stk-${crypto.randomUUID()}`, varId, vStock, 'initial_stock', prodId, now]
+        );
+      }
 
       if (input.mediaIds && input.mediaIds.length > 0) {
         for (const mId of input.mediaIds) {
@@ -2047,6 +2499,27 @@ export class MarketplaceRepo {
         );
       }
 
+      if (patch.status && patch.status !== sub.status) {
+        const orderRow = await tx.queryOne<{ order_number: string; user_id: string | null }>(
+          'SELECT order_number, user_id FROM orders WHERE id = ?',
+          [sub.order_id]
+        );
+        if (orderRow?.user_id) {
+          await this.createNotification(
+            tx,
+            orderRow.user_id,
+            {
+              en: `Order ${orderRow.order_number} update: ${nextStatus}`,
+              ar: `تحديث الطلب ${orderRow.order_number}: ${nextStatus}`,
+            },
+            {
+              en: `Shipment status changed to ${nextStatus}${patch.trackingCode ? ` (Tracking: ${patch.trackingCode})` : ''}.`,
+              ar: `تم تحديث حالة الشحنة إلى ${nextStatus}${patch.trackingCode ? ` (رمز التتبع: ${patch.trackingCode})` : ''}.`,
+            }
+          );
+        }
+      }
+
       await writeAuditLog(tx, {
         actorUserId: actor.id,
         action: 'sub_order.update',
@@ -2064,34 +2537,226 @@ export class MarketplaceRepo {
   async createCoupon(
     sellerId: string | null,
     actorUserId: string,
-    input: { code: string; discountPercent: number; minOrderUsdCents?: number },
+    input: {
+      code: string;
+      discountType?: CouponDiscountType;
+      discountPercent?: number;
+      discountValue?: number;
+      maxDiscountUsdCents?: number | null;
+      minOrderUsdCents?: number;
+      targetType?: OfferTargetType;
+      targetId?: string | null;
+      campaignId?: string | null;
+      maxUses?: number | null;
+      perCustomerLimit?: number;
+      firstOrderOnly?: boolean;
+      autoGeneratedBatch?: string | null;
+      startsAt?: string | null;
+      endsAt?: string | null;
+      active?: boolean;
+    },
     ipAddress?: string
-  ) {
-    const clean = input.code.trim().toUpperCase();
-    if (clean.length < 3) throw new Error('Coupon code must be at least 3 characters.');
-    if (input.discountPercent < 1 || input.discountPercent > 80) throw new Error('Discount percent must be 1–80%.');
+  ): Promise<Coupon> {
+    const clean = input.code.trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+    if (clean.length < 3) throw new Error('Coupon code must be at least 3 alphanumeric characters.');
+    const discountType: CouponDiscountType = input.discountType || 'percent';
+    const rawVal = input.discountValue ?? input.discountPercent ?? 10;
+    const discountValue = discountType === 'free_shipping' ? 0 : Math.round(rawVal);
+
+    if (discountType === 'percent' && (discountValue < 1 || discountValue > 90)) {
+      throw new Error('Discount percent must be 1–90%.');
+    }
+    if (discountType === 'fixed_usd_cents' && discountValue < 50) {
+      throw new Error('Fixed USD coupon discount must be at least $0.50 (50 cents).');
+    }
+
+    const dup = await this.db.queryOne<{ id: string }>('SELECT id FROM coupons WHERE UPPER(code) = ?', [clean]);
+    if (dup) throw new Error(`Coupon code ${clean} already exists.`);
+
     const id = `cpn-${crypto.randomUUID()}`;
     await this.db.execute(
-      `INSERT INTO coupons (id, code, seller_id, discount_type, discount_value, min_order_usd_cents, active)
-       VALUES (?, ?, ?, 'percent', ?, ?, 1)`,
-      [id, clean, sellerId, Math.round(input.discountPercent), Math.max(0, Math.trunc(input.minOrderUsdCents || 0))]
+      `INSERT INTO coupons (id, code, seller_id, discount_type, discount_value, max_discount_usd_cents, min_order_usd_cents, target_type, target_id, campaign_id, max_uses, per_customer_limit, used_count, first_order_only, auto_generated_batch, starts_at, ends_at, active)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        clean,
+        sellerId,
+        discountType,
+        discountValue,
+        input.maxDiscountUsdCents ? Math.max(1, Math.trunc(input.maxDiscountUsdCents)) : null,
+        Math.max(0, Math.trunc(input.minOrderUsdCents || 0)),
+        input.targetType || 'all',
+        input.targetId?.trim() || null,
+        input.campaignId?.trim() || null,
+        input.maxUses ? Math.max(1, Math.trunc(input.maxUses)) : null,
+        Math.max(1, Math.trunc(input.perCustomerLimit ?? 1)),
+        input.firstOrderOnly ? 1 : 0,
+        input.autoGeneratedBatch || null,
+        input.startsAt ? toSqlTimestamp(new Date(input.startsAt)) : null,
+        input.endsAt ? toSqlTimestamp(new Date(input.endsAt)) : null,
+        input.active === false ? 0 : 1,
+      ]
     );
     await writeAuditLog(this.db, {
       actorUserId,
       action: 'coupon.created',
       entityType: 'coupon',
       entityId: id,
-      after: { code: clean, discountPercent: input.discountPercent, sellerId },
+      after: { code: clean, discountType, discountValue, sellerId },
       ipAddress,
     });
-    return {
-      id,
-      code: clean,
-      sellerId,
-      discountPercent: Math.round(input.discountPercent),
-      minOrderUsdCents: Math.max(0, Math.trunc(input.minOrderUsdCents || 0)),
-      active: true,
+    const row = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM coupons WHERE id = ?', [id]);
+    return this.mapCouponRow(row!);
+  }
+
+  async adminGenerateBulkCoupons(
+    actorUserId: string,
+    input: {
+      prefix: string;
+      count: number;
+      discountType: CouponDiscountType;
+      discountValue: number;
+      minOrderUsdCents?: number;
+      maxDiscountUsdCents?: number | null;
+      perCustomerLimit?: number;
+      maxUsesPerCode?: number | null;
+      startsAt?: string | null;
+      endsAt?: string | null;
+      campaignId?: string | null;
+    },
+    ipAddress?: string
+  ): Promise<{ batchId: string; created: Coupon[] }> {
+    const safePrefix = input.prefix.trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '') || 'NL';
+    const qty = Math.min(200, Math.max(1, Math.trunc(input.count)));
+    const batchId = `batch-${crypto.randomUUID().slice(0, 8)}`;
+    const created: Coupon[] = [];
+    for (let i = 0; i < qty; i++) {
+      const suffix = crypto.randomBytes(3).toString('hex').toUpperCase();
+      const code = `${safePrefix}-${suffix}`;
+      const c = await this.createCoupon(
+        null,
+        actorUserId,
+        {
+          code,
+          discountType: input.discountType,
+          discountValue: input.discountValue,
+          minOrderUsdCents: input.minOrderUsdCents,
+          maxDiscountUsdCents: input.maxDiscountUsdCents,
+          perCustomerLimit: input.perCustomerLimit ?? 1,
+          maxUses: input.maxUsesPerCode ?? 1,
+          startsAt: input.startsAt,
+          endsAt: input.endsAt,
+          campaignId: input.campaignId,
+          autoGeneratedBatch: batchId,
+        },
+        ipAddress
+      );
+      created.push(c);
+    }
+    return { batchId, created };
+  }
+
+  async adminImportCouponsCsv(actorUserId: string, csvText: string, ipAddress?: string): Promise<{ imported: number; skipped: string[] }> {
+    const lines = csvText
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    let imported = 0;
+    const skipped: string[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      const cols = lines[i].split(',').map((c) => c.trim().replace(/^"|"$/g, ''));
+      if (i === 0 && cols[0]?.toLowerCase() === 'code') continue;
+      const code = (cols[0] || '').toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+      const dType = (cols[1] as CouponDiscountType) || 'percent';
+      const dVal = Math.round(Number(cols[2] || 10));
+      const minOrderCents = Math.max(0, Math.round(Number(cols[3] || 0) * 100));
+      const maxUses = cols[4] ? Math.max(1, Math.trunc(Number(cols[4]))) : null;
+      const perCust = cols[5] ? Math.max(1, Math.trunc(Number(cols[5]))) : 1;
+      if (!code || code.length < 3 || Number.isNaN(dVal)) {
+        skipped.push(cols[0] || `row_${i + 1}`);
+        continue;
+      }
+      try {
+        await this.createCoupon(
+          null,
+          actorUserId,
+          {
+            code,
+            discountType: ['percent', 'fixed_usd_cents', 'free_shipping'].includes(dType) ? dType : 'percent',
+            discountValue: dType === 'fixed_usd_cents' && dVal < 100 ? dVal * 100 : dVal,
+            minOrderUsdCents: minOrderCents,
+            maxUses,
+            perCustomerLimit: perCust,
+          },
+          ipAddress
+        );
+        imported++;
+      } catch {
+        skipped.push(code);
+      }
+    }
+    return { imported, skipped };
+  }
+
+  async adminExportCouponsCsv(): Promise<string> {
+    const rows = await this.db.query<Record<string, unknown>>('SELECT * FROM coupons ORDER BY code ASC');
+    const safeCsvCell = (raw: string) => {
+      const s = String(raw ?? '');
+      const neutralized = /^[=+\-@\t\r]/.test(s) ? `'${s}` : s;
+      return `"${neutralized.replace(/"/g, '""')}"`;
     };
+    const header = 'code,discount_type,discount_value,min_order_usd,max_uses,per_customer_limit,used_count,active';
+    const body = rows.map((r) => {
+      const c = this.mapCouponRow(r);
+      return [
+        safeCsvCell(c.code),
+        safeCsvCell(c.discountType),
+        String(c.discountValue),
+        (c.minOrderUsdCents / 100).toFixed(2),
+        c.maxUses ?? '',
+        String(c.perCustomerLimit),
+        String(c.usedCount),
+        c.active ? '1' : '0',
+      ].join(',');
+    });
+    return [header, ...body].join('\n');
+  }
+
+  async adminUpdateCoupon(
+    id: string,
+    actorUserId: string,
+    patch: Partial<{ active: boolean; maxUses: number | null; endsAt: string | null }>,
+    ipAddress?: string
+  ): Promise<Coupon> {
+    const existing = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM coupons WHERE id = ?', [id]);
+    if (!existing) throw new Error('Coupon not found.');
+    await this.db.execute('UPDATE coupons SET active = ?, max_uses = ?, ends_at = ? WHERE id = ?', [
+      patch.active !== undefined ? (patch.active ? 1 : 0) : existing.active ? 1 : 0,
+      patch.maxUses !== undefined ? patch.maxUses : existing.max_uses,
+      patch.endsAt !== undefined ? (patch.endsAt ? toSqlTimestamp(new Date(patch.endsAt)) : null) : existing.ends_at,
+      id,
+    ]);
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'coupon.updated',
+      entityType: 'coupon',
+      entityId: id,
+      after: patch,
+      ipAddress,
+    });
+    const row = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM coupons WHERE id = ?', [id]);
+    return this.mapCouponRow(row!);
+  }
+
+  async adminDeleteCoupon(id: string, actorUserId: string, ipAddress?: string): Promise<void> {
+    await this.db.execute('DELETE FROM coupons WHERE id = ?', [id]);
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'coupon.deleted',
+      entityType: 'coupon',
+      entityId: id,
+      ipAddress,
+    });
   }
 
   async requestPayout(sellerId: string, actorUserId: string, amountUsdCents: number, ipAddress?: string) {
@@ -2147,19 +2812,23 @@ export class MarketplaceRepo {
 
   // --- Admin Console ---
   async getAdminOverview() {
-    const [settings, paymentsConfig, categories, deliveryZones, subscriptionPlans, pages] = await Promise.all([
-      this.getPlatformSettings(),
-      this.getPaymentConfig(),
-      this.getCategories(),
-      this.getDeliveryZones(),
-      this.getSubscriptionPlans(),
-      this.getAllPages(),
-    ]);
+    const [settings, paymentsConfig, categories, brands, attributes, deliveryZones, subscriptionPlans, pages, menus] =
+      await Promise.all([
+        this.getPlatformSettings(),
+        this.getPaymentConfig(),
+        this.getCategories(),
+        this.getBrands(),
+        this.getAttributes(),
+        this.getDeliveryZones(),
+        this.getSubscriptionPlans(),
+        this.getAllPages(),
+        this.adminListMenus(),
+      ]);
 
     const sellerRows = await this.db.query<Record<string, unknown>>(
       `SELECT sel.*, st.slug, st.name_json, st.tagline_json, st.about_json, st.announcement_json,
               st.department_slug, st.theme_id, st.logo_media_id, st.banner_media_id, st.rating_avg_x10, st.review_count,
-              ss.delivery_mode, ss.self_delivery_fees_json
+              ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.return_policy_json, ss.seo_title, ss.seo_description
        FROM sellers sel
        INNER JOIN stores st ON st.seller_id = sel.id
        LEFT JOIN store_settings ss ON ss.store_id = st.id
@@ -2168,8 +2837,138 @@ export class MarketplaceRepo {
     const sellers: Seller[] = [];
     for (const r of sellerRows) sellers.push(await this.mapSellerRow(r));
 
+    const prodRows = await this.db.query<Record<string, unknown>>(
+      'SELECT * FROM products WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 200'
+    );
+    const products = await this.mapProductRows(prodRows);
+
+    const sellerDocRows = await this.db.query<{
+      id: string;
+      seller_id: string;
+      doc_type: string;
+      media_id: string;
+      public_url: string;
+      review_status: string;
+      reviewer_note: string | null;
+      created_at: string;
+    }>(
+      `SELECT d.id, d.seller_id, d.doc_type, d.media_id, m.public_url, d.review_status, d.reviewer_note, d.created_at
+       FROM seller_documents d
+       INNER JOIN media m ON m.id = d.media_id
+       ORDER BY d.created_at DESC LIMIT 100`
+    );
+    const sellerDocuments: SellerDocumentReview[] = sellerDocRows.map((d) => ({
+      id: d.id,
+      sellerId: d.seller_id,
+      docType: d.doc_type,
+      mediaId: d.media_id,
+      publicUrl: d.public_url,
+      reviewStatus: d.review_status as SellerDocumentReview['reviewStatus'],
+      reviewerNote: d.reviewer_note,
+      createdAt: String(d.created_at),
+    }));
+
     const orderRows = await this.db.query<Record<string, unknown>>('SELECT * FROM orders ORDER BY created_at DESC LIMIT 100');
     const orders = await this.hydrateOrders(orderRows);
+
+    const returnRows = await this.db.query<Record<string, unknown>>(
+      `SELECT r.*, o.order_number, so.seller_id
+       FROM returns r
+       INNER JOIN sub_orders so ON so.id = r.sub_order_id
+       INNER JOIN orders o ON o.id = so.order_id
+       ORDER BY r.created_at DESC LIMIT 100`
+    );
+    const returnsList: ReturnRequest[] = returnRows.map((r) => ({
+      id: String(r.id),
+      subOrderId: String(r.sub_order_id),
+      userId: String(r.user_id),
+      reason: String(r.reason),
+      status: String(r.status) as ReturnRequest['status'],
+      refundUsdCents: Number(r.refund_usd_cents || 0),
+      createdAt: String(r.created_at),
+      orderNumber: r.order_number ? String(r.order_number) : undefined,
+      sellerId: r.seller_id ? String(r.seller_id) : undefined,
+    }));
+
+    const disputeRows = await this.db.query<Record<string, unknown>>(
+      `SELECT d.*, o.order_number, so.seller_id
+       FROM disputes d
+       INNER JOIN sub_orders so ON so.id = d.sub_order_id
+       INNER JOIN orders o ON o.id = so.order_id
+       ORDER BY d.created_at DESC LIMIT 100`
+    );
+    const disputesList: OrderDispute[] = disputeRows.map((d) => ({
+      id: String(d.id),
+      subOrderId: String(d.sub_order_id),
+      openedByUserId: String(d.opened_by_user_id),
+      reason: String(d.reason),
+      status: String(d.status) as OrderDispute['status'],
+      resolutionNote: d.resolution_note ? String(d.resolution_note) : null,
+      createdAt: String(d.created_at),
+      orderNumber: d.order_number ? String(d.order_number) : undefined,
+      sellerId: d.seller_id ? String(d.seller_id) : undefined,
+    }));
+
+    const ticketRows = await this.db.query<Record<string, unknown>>(
+      'SELECT * FROM support_tickets ORDER BY created_at DESC LIMIT 100'
+    );
+    const supportTickets: SupportTicket[] = ticketRows.map((t) => ({
+      id: String(t.id),
+      userId: t.user_id ? String(t.user_id) : null,
+      email: String(t.email),
+      subject: String(t.subject),
+      message: String(t.message),
+      status: String(t.status) as SupportTicket['status'],
+      createdAt: String(t.created_at),
+    }));
+
+    const reviewRows = await this.db.query<{
+      id: string;
+      product_id: string;
+      seller_id: string;
+      user_id: string;
+      author_name: string;
+      rating: number;
+      comment: string;
+      verified_buyer: number | boolean;
+      seller_reply: string | null;
+      moderation_status: string;
+      product_title_json: string | null;
+      created_at: string;
+    }>(
+      `SELECT r.*, u.name AS author_name, p.title_json AS product_title_json
+       FROM reviews r
+       INNER JOIN users u ON u.id = r.user_id
+       LEFT JOIN products p ON p.id = r.product_id
+       ORDER BY r.created_at DESC LIMIT 100`
+    );
+    const reviews: Review[] = reviewRows.map((r) => ({
+      id: r.id,
+      productId: r.product_id,
+      sellerId: r.seller_id,
+      userId: r.user_id,
+      authorName: r.author_name,
+      rating: Number(r.rating),
+      comment: r.comment,
+      verifiedBuyer: Boolean(r.verified_buyer),
+      sellerReply: r.seller_reply || undefined,
+      moderationStatus: (r.moderation_status || 'approved') as Review['moderationStatus'],
+      productTitle: r.product_title_json ? parseJson<LocalizedText>(r.product_title_json, { en: r.product_id, ar: r.product_id }) : undefined,
+      createdAt: String(r.created_at),
+    }));
+
+    const emailTplRows = await this.db.query<{
+      key?: string;
+      subject_json: string;
+      body_json: string;
+      updated_at: string;
+    }>(`SELECT ${this.keyCol()} AS tpl_key, subject_json, body_json, updated_at FROM email_templates ORDER BY ${this.keyCol()} ASC`);
+    const emailTemplates: EmailTemplateItem[] = emailTplRows.map((et) => ({
+      key: String((et as unknown as { tpl_key: string }).tpl_key),
+      subject: parseJson<LocalizedText>(et.subject_json, { en: '', ar: '' }),
+      body: parseJson<LocalizedText>(et.body_json, { en: '', ar: '' }),
+      updatedAt: String(et.updated_at),
+    }));
 
     const payoutRows = await this.db.query<Record<string, unknown>>('SELECT * FROM payouts ORDER BY created_at DESC LIMIT 100');
     const payouts: PayoutRequest[] = payoutRows.map((p) => {
@@ -2188,15 +2987,8 @@ export class MarketplaceRepo {
       };
     });
 
-    const couponRows = await this.db.query<Record<string, unknown>>('SELECT * FROM coupons');
-    const coupons: Coupon[] = couponRows.map((c) => ({
-      id: String(c.id),
-      code: String(c.code),
-      sellerId: c.seller_id ? String(c.seller_id) : null,
-      discountPercent: Number(c.discount_value),
-      minOrderUsdCents: Number(c.min_order_usd_cents),
-      active: Boolean(c.active),
-    }));
+    const couponRows = await this.db.query<Record<string, unknown>>('SELECT * FROM coupons ORDER BY code ASC');
+    const coupons: Coupon[] = couponRows.map((c) => this.mapCouponRow(c));
 
     const ledgerRows = await this.db.query<Record<string, unknown>>('SELECT * FROM ledger_entries ORDER BY created_at DESC LIMIT 50');
     const ledger: LedgerEntry[] = ledgerRows.map((r) => ({
@@ -2244,6 +3036,36 @@ export class MarketplaceRepo {
       });
     }
 
+    const userSummaryRows = await this.db.query<{
+      id: string;
+      name: string;
+      email: string;
+      phone: string;
+      role_key: string;
+      is_blocked: number | boolean;
+      totp_enabled: number | boolean;
+      created_at: string;
+    }>(
+      'SELECT id, name, email, phone, role_key, is_blocked, totp_enabled, created_at FROM users WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 120'
+    );
+    const users = [];
+    for (const u of userSummaryRows) {
+      const perms = await this.db.query<{ permission_key: string }>('SELECT permission_key FROM user_permissions WHERE user_id = ?', [
+        u.id,
+      ]);
+      users.push({
+        id: u.id,
+        name: u.name,
+        email: u.email,
+        phone: u.phone,
+        roleKey: u.role_key,
+        isBlocked: Boolean(u.is_blocked),
+        totpEnabled: Boolean(u.totp_enabled),
+        permissions: perms.map((p) => p.permission_key),
+        createdAt: String(u.created_at),
+      });
+    }
+
     const recentJobs = await this.db.query('SELECT id, job_type, status, attempts, last_error, created_at FROM jobs ORDER BY created_at DESC LIMIT 25');
     const emailLog = await this.db.query('SELECT * FROM email_log ORDER BY created_at DESC LIMIT 25');
     const errorLog = await this.db.query('SELECT id, route, message, created_at FROM error_log ORDER BY created_at DESC LIMIT 25');
@@ -2261,12 +3083,34 @@ export class MarketplaceRepo {
         return sum + (plan?.monthlyFeeUsdCents || 0);
       }, 0);
 
-    const [homeBuilderData, bannersList, popupsList, featuredPlacementsList, offersList] = await Promise.all([
+    const [
+      homeBuilderData,
+      bannersList,
+      popupsList,
+      featuredPlacementsList,
+      offersList,
+      flashSalesList,
+      campaignsList,
+      segmentsList,
+      emailCampaignsList,
+      automationFlowsList,
+      newsletterSubscribersList,
+      sellerPromoRules,
+      marketingAnalytics,
+    ] = await Promise.all([
       this.adminListHomeSections(),
       this.adminListBanners(),
       this.adminListPopups(),
       this.adminListFeaturedPlacements(),
       this.adminListOffers(),
+      this.adminListFlashSales(),
+      this.adminListCampaigns(),
+      this.adminListSegments(),
+      this.adminListEmailCampaigns(),
+      this.adminListAutomationFlows(),
+      this.adminListNewsletterSubscribers(),
+      this.getSellerPromoRules(),
+      this.getMarketingAnalytics(),
     ]);
 
     return {
@@ -2281,22 +3125,41 @@ export class MarketplaceRepo {
       settings,
       paymentsConfig,
       categories,
+      brands,
+      attributes,
       sellers,
+      products,
+      sellerDocuments,
       orders,
+      returns: returnsList,
+      disputes: disputesList,
+      supportTickets,
+      reviews,
+      emailTemplates,
       payouts,
       coupons,
       deliveryZones,
       subscriptionPlans,
       ledger,
       pages,
+      menus,
       homeSections: homeBuilderData.sections,
       homeSectionVersions: homeBuilderData.versionsBySectionId,
       banners: bannersList,
       popups: popupsList,
       featuredPlacements: featuredPlacementsList,
       offers: offersList,
+      flashSales: flashSalesList,
+      campaigns: campaignsList,
+      segments: segmentsList,
+      emailCampaigns: emailCampaignsList,
+      automationFlows: automationFlowsList,
+      newsletterSubscribers: newsletterSubscribersList,
+      sellerPromoRules,
+      marketingAnalytics,
       auditLog,
       staffUsers,
+      users,
       recentJobs,
       emailLog,
       errorLog,
@@ -2344,6 +3207,18 @@ export class MarketplaceRepo {
         );
       }
 
+      if (patch.status && patch.status !== prev.status) {
+        await this.createNotification(
+          tx,
+          prev.owner_user_id,
+          { en: `Store status: ${patch.status}`, ar: `حالة المتجر: ${patch.status}` },
+          {
+            en: `Your merchant account status was updated to ${patch.status}.`,
+            ar: `تم تحديث حالة حساب متجرك إلى ${patch.status}.`,
+          }
+        );
+      }
+
       if (patch.status === 'approved' && prev.status !== 'approved') {
         const owner = await tx.queryOne<{ email: string; preferred_locale: string }>('SELECT email, preferred_locale FROM users WHERE id = ?', [
           prev.owner_user_id,
@@ -2372,7 +3247,15 @@ export class MarketplaceRepo {
         ipAddress,
       });
 
-      return this.getSellerById(sellerId);
+      const updatedRow = await tx.queryOne<Record<string, unknown>>(
+        `SELECT sel.*, st.slug, st.name_json, st.tagline_json, st.about_json, st.announcement_json,
+                st.department_slug, st.theme_id, st.logo_media_id, st.banner_media_id, st.rating_avg_x10, st.review_count,
+                ss.delivery_mode, ss.self_delivery_fees_json, ss.processing_hours, ss.vacation_mode, ss.return_policy_json, ss.seo_title, ss.seo_description
+         FROM sellers sel INNER JOIN stores st ON st.seller_id = sel.id LEFT JOIN store_settings ss ON ss.store_id = st.id
+         WHERE sel.id = ? LIMIT 1`,
+        [sellerId]
+      );
+      return updatedRow ? this.mapSellerRow(updatedRow, tx) : null;
     });
   }
 
@@ -2466,11 +3349,17 @@ export class MarketplaceRepo {
         [`led-${crypto.randomUUID()}`, pay.seller_id, pay.amount_usd_cents, `Payout settled (${referenceCode.trim()})`, now]
       );
 
-      const owner = await tx.queryOne<{ email: string; preferred_locale: string }>(
-        `SELECT u.email, u.preferred_locale FROM sellers s INNER JOIN users u ON u.id = s.owner_user_id WHERE s.id = ?`,
+      const owner = await tx.queryOne<{ id: string; email: string; preferred_locale: string }>(
+        `SELECT u.id, u.email, u.preferred_locale FROM sellers s INNER JOIN users u ON u.id = s.owner_user_id WHERE s.id = ?`,
         [pay.seller_id]
       );
       if (owner) {
+        await this.createNotification(
+          tx,
+          owner.id,
+          { en: `Payout settled ($${(Number(pay.amount_usd_cents) / 100).toFixed(2)})`, ar: `تم تحويل أرباحك ($${(Number(pay.amount_usd_cents) / 100).toFixed(2)})` },
+          { en: `Transfer reference: ${referenceCode.trim()}`, ar: `مرجع التحويل: ${referenceCode.trim()}` }
+        );
         await queueEmail(tx, {
           to: owner.email,
           templateKey: 'payout_paid',
@@ -3502,26 +4391,96 @@ export class MarketplaceRepo {
     if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
       throw new Error(locale === 'ar' ? 'أدخل بريداً إلكترونياً صحيحاً' : 'Please enter a valid email address.');
     }
-    const existing = await this.db.queryOne<{ id: string; status: string }>(
-      'SELECT id, status FROM newsletter_subscribers WHERE LOWER(email) = ?',
+    const existing = await this.db.queryOne<{ id: string; status: string; unsubscribe_token: string }>(
+      'SELECT id, status, unsubscribe_token FROM newsletter_subscribers WHERE LOWER(email) = ?',
       [cleanEmail]
     );
     const now = toSqlTimestamp();
+    let subscriberId: string;
+    let unsubscribeToken: string;
+    let alreadySubscribed = false;
+
     if (existing) {
+      subscriberId = existing.id;
+      unsubscribeToken = existing.unsubscribe_token;
+      alreadySubscribed = true;
       await this.db.execute(
         "UPDATE newsletter_subscribers SET status = 'subscribed', locale = ?, source = ?, consented_at = ? WHERE id = ?",
         [locale, source.slice(0, 60), now, existing.id]
       );
-      return { id: existing.id, email: cleanEmail, status: 'subscribed' as const, alreadySubscribed: true };
+    } else {
+      subscriberId = `sub-${crypto.randomUUID()}`;
+      unsubscribeToken = crypto.randomBytes(24).toString('hex');
+      await this.db.execute(
+        `INSERT INTO newsletter_subscribers (id, email, locale, source, status, unsubscribe_token, consented_at, created_at)
+         VALUES (?, ?, ?, ?, 'subscribed', ?, ?, ?)`,
+        [subscriberId, cleanEmail, locale, source.slice(0, 60), unsubscribeToken, now, now]
+      );
     }
-    const id = `sub-${crypto.randomUUID()}`;
-    const token = crypto.randomBytes(24).toString('hex');
-    await this.db.execute(
-      `INSERT INTO newsletter_subscribers (id, email, locale, source, status, unsubscribe_token, consented_at, created_at)
-       VALUES (?, ?, ?, ?, 'subscribed', ?, ?, ?)`,
-      [id, cleanEmail, locale, source.slice(0, 60), token, now, now]
+
+    // Trigger active welcome_subscriber automation flows (deduplicated per subscriber)
+    const welcomeFlows = await this.db.query<Record<string, unknown>>(
+      "SELECT * FROM automation_flows WHERE trigger_type = 'welcome_subscriber' AND active = 1"
     );
-    return { id, email: cleanEmail, status: 'subscribed' as const, alreadySubscribed: false };
+    for (const flow of welcomeFlows) {
+      const flowId = String(flow.id);
+      const dedupKey = `welcome:${subscriberId}`;
+      const dupExec = await this.db.queryOne<{ id: string }>(
+        'SELECT id FROM automation_executions WHERE flow_id = ? AND dedup_key = ?',
+        [flowId, dedupKey]
+      );
+      if (dupExec) continue;
+      await this.db.execute(
+        'INSERT INTO automation_executions (id, flow_id, dedup_key, recipient_email, created_at) VALUES (?, ?, ?, ?, ?)',
+        [`aex-${crypto.randomUUID()}`, flowId, dedupKey, cleanEmail, now]
+      );
+      const subjectJson = parseJson<{ en: string; ar: string }>(flow.subject_json, { en: 'Welcome to NileLink', ar: 'أهلاً بك في نيل لينك' });
+      const blocks = parseJson<EmailBlock[]>(flow.blocks_json, []);
+      const delayHours = Math.max(0, Number(flow.delay_hours ?? 0));
+      const runAt = delayHours > 0 ? new Date(Date.now() + delayHours * 3_600_000) : new Date();
+      const payload: MarketingEmailJobPayload = {
+        flowId,
+        to: cleanEmail,
+        locale,
+        subject: subjectJson[locale] || subjectJson.en || 'Welcome to NileLink',
+        blocks,
+        attachCouponCode: flow.attach_coupon_code ? String(flow.attach_coupon_code) : null,
+        unsubscribeToken,
+      };
+      await enqueueJob(this.db, 'send_marketing_email', payload as unknown as Record<string, unknown>, runAt);
+      await this.db.execute(
+        'UPDATE automation_flows SET total_triggered = total_triggered + 1, last_run_at = ? WHERE id = ?',
+        [now, flowId]
+      );
+    }
+
+    return { id: subscriberId, email: cleanEmail, status: 'subscribed' as const, alreadySubscribed };
+  }
+
+  async unsubscribeNewsletterByToken(token: string): Promise<boolean> {
+    const clean = token.trim();
+    if (!clean) return false;
+    const row = await this.db.queryOne<{ id: string }>(
+      'SELECT id FROM newsletter_subscribers WHERE unsubscribe_token = ? LIMIT 1',
+      [clean]
+    );
+    if (!row) return false;
+    await this.db.execute("UPDATE newsletter_subscribers SET status = 'unsubscribed' WHERE id = ?", [row.id]);
+    return true;
+  }
+
+  async adminListNewsletterSubscribers(): Promise<NewsletterSubscriber[]> {
+    const rows = await this.db.query<Record<string, unknown>>(
+      'SELECT id, email, locale, source, status, consented_at FROM newsletter_subscribers ORDER BY consented_at DESC LIMIT 500'
+    );
+    return rows.map((r) => ({
+      id: String(r.id),
+      email: String(r.email),
+      locale: (r.locale === 'ar' ? 'ar' : 'en') as 'en' | 'ar',
+      source: String(r.source || 'home'),
+      status: r.status === 'unsubscribed' ? 'unsubscribed' : 'subscribed',
+      consentedAt: String(r.consented_at),
+    }));
   }
 
   // --- Step 3: Multi-Placement Banners, Bot-Filtered Tracking, Popups & Featured Placements ---
@@ -4214,7 +5173,7 @@ export class MarketplaceRepo {
     });
   }
 
-  // --- Phase B: Offers & Promotions Engine ---
+  // --- Phase B & Marketing Hub: Offers, Conflict Check, Flash Sales & Campaigns ---
   private mapOfferRow(row: Record<string, unknown>): Offer {
     return {
       id: String(row.id),
@@ -4225,6 +5184,12 @@ export class MarketplaceRepo {
       discountValue: Number(row.discount_value),
       targetType: String(row.target_type) as OfferTargetType,
       targetId: row.target_id ? String(row.target_id) : null,
+      stackingRule: String(row.stacking_rule || 'best_only') as OfferStackingRule,
+      fundingSource: String(row.funding_source || 'platform') as OfferFundingSource,
+      fundingPlatformBps: Number(row.funding_platform_bps ?? 10000),
+      campaignId: row.campaign_id ? String(row.campaign_id) : null,
+      priority: Number(row.priority ?? 10),
+      rules: row.rules_json ? parseJson<OfferRulesConfig>(row.rules_json, {}) : undefined,
       approvalStatus: String(row.approval_status || 'pending') as OfferApprovalStatus,
       startsAt: row.starts_at ? String(row.starts_at) : null,
       endsAt: row.ends_at ? String(row.ends_at) : null,
@@ -4237,7 +5202,8 @@ export class MarketplaceRepo {
       `SELECT o.*, st.name_json AS seller_name_json
        FROM offers o
        LEFT JOIN stores st ON st.seller_id = o.seller_id
-       WHERE o.approval_status = 'approved' AND o.active = 1`
+       WHERE o.approval_status = 'approved' AND o.active = 1
+       ORDER BY o.priority DESC`
     );
     const nowMs = Date.now();
     return rows.map((r) => this.mapOfferRow(r)).filter((o) => isWithinSchedule(o.startsAt, o.endsAt, nowMs));
@@ -4248,9 +5214,54 @@ export class MarketplaceRepo {
       `SELECT o.*, st.name_json AS seller_name_json
        FROM offers o
        LEFT JOIN stores st ON st.seller_id = o.seller_id
-       ORDER BY o.approval_status ASC, o.id DESC`
+       ORDER BY o.priority DESC, o.approval_status ASC, o.id DESC`
     );
     return rows.map((r) => this.mapOfferRow(r));
+  }
+
+  async checkOfferConflicts(input: {
+    offerType: OfferType;
+    targetType: OfferTargetType;
+    targetId?: string | null;
+    stackingRule?: OfferStackingRule;
+    startsAt?: string | null;
+    endsAt?: string | null;
+    excludeOfferId?: string;
+  }): Promise<OfferConflict[]> {
+    const all = await this.adminListOffers();
+    const sNew = input.startsAt ? Date.parse(input.startsAt) : -Infinity;
+    const eNew = input.endsAt ? Date.parse(input.endsAt) : Infinity;
+    const conflicts: OfferConflict[] = [];
+
+    for (const existing of all) {
+      if (existing.id === input.excludeOfferId) continue;
+      if (!existing.active || existing.approvalStatus === 'rejected') continue;
+      const sOld = existing.startsAt ? Date.parse(existing.startsAt) : -Infinity;
+      const eOld = existing.endsAt ? Date.parse(existing.endsAt) : Infinity;
+      const datesOverlap = sNew <= eOld && eNew >= sOld;
+      if (!datesOverlap) continue;
+
+      const sameScope =
+        existing.targetType === 'all' ||
+        input.targetType === 'all' ||
+        (existing.targetType === input.targetType && (existing.targetId || '') === (input.targetId || ''));
+      if (!sameScope) continue;
+
+      if (existing.stackingRule === 'exclusive' || input.stackingRule === 'exclusive') {
+        conflicts.push({
+          conflictingOfferId: existing.id,
+          conflictingTitle: existing.title.en,
+          reason: `Exclusive stacking conflict on ${existing.targetType} scope during overlapping dates.`,
+        });
+      } else {
+        conflicts.push({
+          conflictingOfferId: existing.id,
+          conflictingTitle: existing.title.en,
+          reason: `Overlapping ${existing.offerType} promotion on ${existing.targetType} (${existing.stackingRule}).`,
+        });
+      }
+    }
+    return conflicts;
   }
 
   async adminCreateOffer(
@@ -4261,22 +5272,35 @@ export class MarketplaceRepo {
       discountValue: number;
       targetType: OfferTargetType;
       targetId?: string | null;
+      stackingRule?: OfferStackingRule;
+      fundingSource?: OfferFundingSource;
+      fundingPlatformBps?: number;
+      campaignId?: string | null;
+      priority?: number;
+      rules?: OfferRulesConfig;
       startsAt?: string | null;
       endsAt?: string | null;
       active?: boolean;
     },
     ipAddress?: string
   ): Promise<Offer> {
-    if (input.offerType !== 'fixed_usd_cents' && (input.discountValue < 1 || input.discountValue > 90)) {
+    if (
+      ['percent', 'flash_percent', 'first_order', 'vip_exclusive'].includes(input.offerType) &&
+      (input.discountValue < 1 || input.discountValue > 90)
+    ) {
       throw new Error('Percentage discount must be between 1% and 90%.');
     }
     if (input.offerType === 'fixed_usd_cents' && input.discountValue < 1) {
       throw new Error('Fixed discount must be at least 1 USD cent.');
     }
     const id = `off-${crypto.randomUUID()}`;
+    const fundingSource: OfferFundingSource = input.fundingSource || 'platform';
+    const fundingPlatformBps =
+      fundingSource === 'platform' ? 10000 : fundingSource === 'seller' ? 0 : Math.min(10000, Math.max(0, Math.trunc(input.fundingPlatformBps ?? 5000)));
+
     await this.db.execute(
-      `INSERT INTO offers (id, seller_id, title_json, offer_type, discount_value, target_type, target_id, approval_status, starts_at, ends_at, active)
-       VALUES (?, NULL, ?, ?, ?, ?, ?, 'approved', ?, ?, ?)`,
+      `INSERT INTO offers (id, seller_id, title_json, offer_type, discount_value, target_type, target_id, stacking_rule, funding_source, funding_platform_bps, campaign_id, priority, rules_json, approval_status, starts_at, ends_at, active)
+       VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?)`,
       [
         id,
         JSON.stringify(input.title),
@@ -4284,6 +5308,12 @@ export class MarketplaceRepo {
         Math.round(input.discountValue),
         input.targetType,
         input.targetId?.trim() || null,
+        input.stackingRule || 'best_only',
+        fundingSource,
+        fundingPlatformBps,
+        input.campaignId?.trim() || null,
+        Math.trunc(input.priority ?? 10),
+        input.rules ? JSON.stringify(input.rules) : null,
         input.startsAt ? toSqlTimestamp(new Date(input.startsAt)) : null,
         input.endsAt ? toSqlTimestamp(new Date(input.endsAt)) : null,
         input.active === false ? 0 : 1,
@@ -4294,7 +5324,13 @@ export class MarketplaceRepo {
       action: 'admin.create_offer',
       entityType: 'offer',
       entityId: id,
-      after: { offerType: input.offerType, discountValue: input.discountValue, targetType: input.targetType },
+      after: {
+        offerType: input.offerType,
+        discountValue: input.discountValue,
+        targetType: input.targetType,
+        stackingRule: input.stackingRule || 'best_only',
+        fundingSource,
+      },
       ipAddress,
     });
     const row = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM offers WHERE id = ?', [id]);
@@ -4343,6 +5379,330 @@ export class MarketplaceRepo {
     });
   }
 
+  // --- Flash Sales & Stock Caps ---
+  private async hydrateFlashSales(saleRows: Array<Record<string, unknown>>, tx: DbTx = this.db): Promise<FlashSale[]> {
+    const results: FlashSale[] = [];
+    for (const s of saleRows) {
+      const itemRows = await tx.query<Record<string, unknown>>(
+        `SELECT fsi.*, p.title_json AS product_title_json, p.base_price_usd_cents AS base_price_usd_cents
+         FROM flash_sale_items fsi
+         LEFT JOIN products p ON p.id = fsi.product_id
+         WHERE fsi.flash_sale_id = ?`,
+        [String(s.id)]
+      );
+      const items: FlashSaleItem[] = itemRows.map((it) => ({
+        id: String(it.id),
+        flashSaleId: String(it.flash_sale_id),
+        productId: String(it.product_id),
+        productTitle: it.product_title_json ? parseJson<LocalizedText>(it.product_title_json, { en: 'Product', ar: 'منتج' }) : undefined,
+        basePriceUsdCents: it.base_price_usd_cents !== null && it.base_price_usd_cents !== undefined ? Number(it.base_price_usd_cents) : undefined,
+        salePriceUsdCents: Number(it.sale_price_usd_cents),
+        discountPercent: Number(it.discount_percent),
+        stockCap: Number(it.stock_cap),
+        claimedCount: Number(it.claimed_count),
+      }));
+      results.push({
+        id: String(s.id),
+        slug: String(s.slug),
+        title: parseJson<LocalizedText>(s.title_json, { en: '', ar: '' }),
+        bgToken: String(s.bg_token || 'ember') as BannerBgToken,
+        startsAt: String(s.starts_at),
+        endsAt: String(s.ends_at),
+        status: String(s.status || 'scheduled') as FlashSaleStatus,
+        autoRevert: Boolean(s.auto_revert),
+        items,
+        createdAt: String(s.created_at),
+      });
+    }
+    return results;
+  }
+
+  async getActiveFlashSales(tx: DbTx = this.db): Promise<FlashSale[]> {
+    const rows = await tx.query<Record<string, unknown>>(
+      "SELECT * FROM flash_sales WHERE status != 'ended' ORDER BY ends_at ASC"
+    );
+    const hydrated = await this.hydrateFlashSales(rows, tx);
+    const nowMs = Date.now();
+    return hydrated.filter((fs) => isWithinSchedule(fs.startsAt, fs.endsAt, nowMs));
+  }
+
+  async adminListFlashSales(): Promise<FlashSale[]> {
+    const rows = await this.db.query<Record<string, unknown>>('SELECT * FROM flash_sales ORDER BY created_at DESC');
+    return this.hydrateFlashSales(rows);
+  }
+
+  async adminCreateFlashSale(
+    actorUserId: string,
+    input: {
+      slug?: string;
+      title: LocalizedText;
+      bgToken?: BannerBgToken;
+      startsAt: string;
+      endsAt: string;
+      autoRevert?: boolean;
+      items: Array<{ productId: string; discountPercent: number; stockCap: number }>;
+    },
+    ipAddress?: string
+  ): Promise<FlashSale> {
+    if (!input.items || input.items.length === 0) throw new Error('Select at least one product for a flash sale.');
+    const startMs = Date.parse(input.startsAt);
+    const endMs = Date.parse(input.endsAt);
+    if (Number.isNaN(startMs) || Number.isNaN(endMs) || endMs <= startMs) {
+      throw new Error('Flash sale end date must be after start date.');
+    }
+
+    return this.db.transaction(async (tx) => {
+      const id = `fls-${crypto.randomUUID()}`;
+      const baseSlug = (input.slug || input.title.en || 'flash-sale')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-|-$/g, '') || 'flash';
+      const slug = `${baseSlug}-${crypto.randomInt(100, 999)}`;
+      const nowMs = Date.now();
+      const status: FlashSaleStatus = nowMs >= startMs && nowMs < endMs ? 'active' : nowMs >= endMs ? 'ended' : 'scheduled';
+      const nowSql = toSqlTimestamp();
+
+      await tx.execute(
+        `INSERT INTO flash_sales (id, slug, title_json, bg_token, starts_at, ends_at, status, auto_revert, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          id,
+          slug,
+          JSON.stringify(input.title),
+          input.bgToken || 'ember',
+          toSqlTimestamp(new Date(startMs)),
+          toSqlTimestamp(new Date(endMs)),
+          status,
+          input.autoRevert === false ? 0 : 1,
+          nowSql,
+        ]
+      );
+
+      for (const item of input.items) {
+        const prod = await tx.queryOne<{ id: string; base_price_usd_cents: number }>(
+          'SELECT id, base_price_usd_cents FROM products WHERE id = ? AND deleted_at IS NULL',
+          [item.productId]
+        );
+        if (!prod) throw new Error(`Product ${item.productId} not found.`);
+        const pct = Math.min(90, Math.max(1, Math.round(item.discountPercent)));
+        const salePrice = Math.max(1, Math.round(Number(prod.base_price_usd_cents) * (100 - pct) / 100));
+        await tx.execute(
+          `INSERT INTO flash_sale_items (id, flash_sale_id, product_id, sale_price_usd_cents, discount_percent, stock_cap, claimed_count)
+           VALUES (?, ?, ?, ?, ?, ?, 0)`,
+          [`fsi-${crypto.randomUUID()}`, id, prod.id, salePrice, pct, Math.max(0, Math.trunc(item.stockCap || 0))]
+        );
+      }
+
+      await writeAuditLog(tx, {
+        actorUserId,
+        action: 'admin.create_flash_sale',
+        entityType: 'flash_sale',
+        entityId: id,
+        after: { slug, status, itemCount: input.items.length },
+        ipAddress,
+      });
+
+      const [created] = await this.hydrateFlashSales(
+        await tx.query<Record<string, unknown>>('SELECT * FROM flash_sales WHERE id = ?', [id]),
+        tx
+      );
+      return created;
+    });
+  }
+
+  async adminUpdateFlashSaleStatus(id: string, actorUserId: string, status: FlashSaleStatus, ipAddress?: string): Promise<FlashSale> {
+    await this.db.execute('UPDATE flash_sales SET status = ? WHERE id = ?', [status, id]);
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.update_flash_sale',
+      entityType: 'flash_sale',
+      entityId: id,
+      after: { status },
+      ipAddress,
+    });
+    const [row] = await this.hydrateFlashSales(
+      await this.db.query<Record<string, unknown>>('SELECT * FROM flash_sales WHERE id = ?', [id])
+    );
+    if (!row) throw new Error('Flash sale not found.');
+    return row;
+  }
+
+  async adminDeleteFlashSale(id: string, actorUserId: string, ipAddress?: string): Promise<void> {
+    await this.db.execute('DELETE FROM flash_sale_items WHERE flash_sale_id = ?', [id]);
+    await this.db.execute('DELETE FROM flash_sales WHERE id = ?', [id]);
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.delete_flash_sale',
+      entityType: 'flash_sale',
+      entityId: id,
+      ipAddress,
+    });
+  }
+
+  // --- Marketing Campaigns ---
+  private mapCampaignRow(row: Record<string, unknown>): Campaign {
+    return {
+      id: String(row.id),
+      slug: String(row.slug),
+      title: parseJson<LocalizedText>(row.title_json, { en: '', ar: '' }),
+      subtitle: parseJson<LocalizedText>(row.subtitle_json, { en: '', ar: '' }),
+      description: parseJson<LocalizedText>(row.description_json, { en: '', ar: '' }),
+      heroImageUrl: row.hero_image_url ? String(row.hero_image_url) : null,
+      bgToken: String(row.bg_token || 'ember') as BannerBgToken,
+      startsAt: row.starts_at ? String(row.starts_at) : null,
+      endsAt: row.ends_at ? String(row.ends_at) : null,
+      status: String(row.status || 'draft') as CampaignStatus,
+      featuredOfferIds: parseJson<string[]>(row.featured_offer_ids_json, []),
+      featuredCouponCodes: parseJson<string[]>(row.featured_coupon_codes_json, []),
+      featuredFlashSaleId: row.featured_flash_sale_id ? String(row.featured_flash_sale_id) : null,
+      createdAt: String(row.created_at),
+    };
+  }
+
+  async getActiveCampaigns(): Promise<Campaign[]> {
+    const rows = await this.db.query<Record<string, unknown>>(
+      "SELECT * FROM campaigns WHERE status IN ('active', 'scheduled') ORDER BY created_at DESC"
+    );
+    const nowMs = Date.now();
+    return rows.map((r) => this.mapCampaignRow(r)).filter((c) => c.status === 'active' && isWithinSchedule(c.startsAt, c.endsAt, nowMs));
+  }
+
+  async getPublicCampaignBySlug(slug: string): Promise<Campaign | null> {
+    const row = await this.db.queryOne<Record<string, unknown>>(
+      "SELECT * FROM campaigns WHERE slug = ? AND status != 'draft' LIMIT 1",
+      [slug.trim()]
+    );
+    return row ? this.mapCampaignRow(row) : null;
+  }
+
+  async adminListCampaigns(): Promise<Campaign[]> {
+    const rows = await this.db.query<Record<string, unknown>>('SELECT * FROM campaigns ORDER BY created_at DESC');
+    return rows.map((r) => this.mapCampaignRow(r));
+  }
+
+  async adminCreateCampaign(
+    actorUserId: string,
+    input: {
+      slug: string;
+      title: LocalizedText;
+      subtitle: LocalizedText;
+      description: LocalizedText;
+      heroImageUrl?: string | null;
+      bgToken?: BannerBgToken;
+      startsAt?: string | null;
+      endsAt?: string | null;
+      status?: CampaignStatus;
+      featuredOfferIds?: string[];
+      featuredCouponCodes?: string[];
+      featuredFlashSaleId?: string | null;
+    },
+    ipAddress?: string
+  ): Promise<Campaign> {
+    const cleanSlug =
+      input.slug
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9-]+/g, '-')
+        .replace(/^-|-$/g, '') || `campaign-${crypto.randomInt(100, 999)}`;
+    const dup = await this.db.queryOne<{ id: string }>('SELECT id FROM campaigns WHERE slug = ?', [cleanSlug]);
+    if (dup) throw new Error(`Campaign slug '${cleanSlug}' already exists.`);
+
+    const id = `cmp-${crypto.randomUUID()}`;
+    const now = toSqlTimestamp();
+    await this.db.execute(
+      `INSERT INTO campaigns (id, slug, title_json, subtitle_json, description_json, hero_image_url, bg_token, starts_at, ends_at, status, featured_offer_ids_json, featured_coupon_codes_json, featured_flash_sale_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        cleanSlug,
+        JSON.stringify(input.title),
+        JSON.stringify(input.subtitle),
+        JSON.stringify(input.description),
+        input.heroImageUrl ? input.heroImageUrl.trim() : null,
+        input.bgToken || 'ember',
+        input.startsAt ? toSqlTimestamp(new Date(input.startsAt)) : null,
+        input.endsAt ? toSqlTimestamp(new Date(input.endsAt)) : null,
+        input.status || 'active',
+        JSON.stringify(input.featuredOfferIds || []),
+        JSON.stringify((input.featuredCouponCodes || []).map((c) => c.trim().toUpperCase()).filter(Boolean)),
+        input.featuredFlashSaleId || null,
+        now,
+      ]
+    );
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.create_campaign',
+      entityType: 'campaign',
+      entityId: id,
+      after: { slug: cleanSlug, status: input.status || 'active' },
+      ipAddress,
+    });
+    const row = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM campaigns WHERE id = ?', [id]);
+    return this.mapCampaignRow(row!);
+  }
+
+  async adminUpdateCampaign(
+    id: string,
+    actorUserId: string,
+    patch: Partial<{
+      title: LocalizedText;
+      subtitle: LocalizedText;
+      description: LocalizedText;
+      heroImageUrl: string | null;
+      bgToken: BannerBgToken;
+      startsAt: string | null;
+      endsAt: string | null;
+      status: CampaignStatus;
+      featuredOfferIds: string[];
+      featuredCouponCodes: string[];
+      featuredFlashSaleId: string | null;
+    }>,
+    ipAddress?: string
+  ): Promise<Campaign> {
+    const existingRow = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM campaigns WHERE id = ?', [id]);
+    if (!existingRow) throw new Error('Campaign not found.');
+    const existing = this.mapCampaignRow(existingRow);
+
+    await this.db.execute(
+      `UPDATE campaigns SET title_json = ?, subtitle_json = ?, description_json = ?, hero_image_url = ?, bg_token = ?, starts_at = ?, ends_at = ?, status = ?, featured_offer_ids_json = ?, featured_coupon_codes_json = ?, featured_flash_sale_id = ? WHERE id = ?`,
+      [
+        JSON.stringify(patch.title ?? existing.title),
+        JSON.stringify(patch.subtitle ?? existing.subtitle),
+        JSON.stringify(patch.description ?? existing.description),
+        patch.heroImageUrl !== undefined ? (patch.heroImageUrl ? patch.heroImageUrl.trim() : null) : existing.heroImageUrl ?? null,
+        patch.bgToken ?? existing.bgToken,
+        patch.startsAt !== undefined ? (patch.startsAt ? toSqlTimestamp(new Date(patch.startsAt)) : null) : existing.startsAt,
+        patch.endsAt !== undefined ? (patch.endsAt ? toSqlTimestamp(new Date(patch.endsAt)) : null) : existing.endsAt,
+        patch.status ?? existing.status,
+        JSON.stringify(patch.featuredOfferIds ?? existing.featuredOfferIds),
+        JSON.stringify(patch.featuredCouponCodes ?? existing.featuredCouponCodes),
+        patch.featuredFlashSaleId !== undefined ? patch.featuredFlashSaleId : existing.featuredFlashSaleId ?? null,
+        id,
+      ]
+    );
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.update_campaign',
+      entityType: 'campaign',
+      entityId: id,
+      after: patch,
+      ipAddress,
+    });
+    const row = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM campaigns WHERE id = ?', [id]);
+    return this.mapCampaignRow(row!);
+  }
+
+  async adminDeleteCampaign(id: string, actorUserId: string, ipAddress?: string): Promise<void> {
+    await this.db.execute('DELETE FROM campaigns WHERE id = ?', [id]);
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.delete_campaign',
+      entityType: 'campaign',
+      entityId: id,
+      ipAddress,
+    });
+  }
+
   async sellerListOffers(sellerId: string): Promise<Offer[]> {
     const rows = await this.db.query<Record<string, unknown>>(
       `SELECT o.*, st.name_json AS seller_name_json
@@ -4369,9 +5729,30 @@ export class MarketplaceRepo {
     },
     ipAddress?: string
   ): Promise<Offer> {
-    if (input.offerType !== 'fixed_usd_cents' && (input.discountValue < 1 || input.discountValue > 85)) {
-      throw new Error('Seller discount percent must be between 1% and 85%.');
+    const rules = await this.getSellerPromoRules();
+    if (!rules.sellerOffersEnabled) {
+      throw new Error('Seller-submitted offers are currently paused by marketplace administration.');
     }
+    if (input.offerType === 'flash_percent' && !rules.allowFlashOffersBySellers) {
+      throw new Error('Flash offers are restricted to admin campaigns under current marketplace rules.');
+    }
+    if (input.offerType !== 'fixed_usd_cents' && (input.discountValue < 1 || input.discountValue > rules.maxDiscountPercent)) {
+      throw new Error(`Seller discount percent must be between 1% and ${rules.maxDiscountPercent}%.`);
+    }
+    if (input.offerType === 'fixed_usd_cents' && (input.discountValue < 100 || input.discountValue > rules.maxFixedDiscountUsdCents)) {
+      throw new Error(
+        `Seller fixed discount must be between $1.00 and $${(rules.maxFixedDiscountUsdCents / 100).toFixed(2)}.`
+      );
+    }
+
+    const activeCntRow = await this.db.queryOne<{ cnt: number }>(
+      "SELECT COUNT(*) AS cnt FROM offers WHERE seller_id = ? AND approval_status != 'rejected' AND active = 1",
+      [sellerId]
+    );
+    if (Number(activeCntRow?.cnt ?? 0) >= rules.maxActiveOffersPerSeller) {
+      throw new Error(`Maximum ${rules.maxActiveOffersPerSeller} active/pending offers allowed per seller.`);
+    }
+
     let resolvedTargetId = sellerId;
     if (input.targetType === 'product') {
       if (!input.targetId) throw new Error('Select a product for product-level offers.');
@@ -4383,10 +5764,11 @@ export class MarketplaceRepo {
       resolvedTargetId = prod.id;
     }
 
+    const approvalStatus: OfferApprovalStatus = rules.requireAdminApproval ? 'pending' : 'approved';
     const id = `off-${crypto.randomUUID()}`;
     await this.db.execute(
       `INSERT INTO offers (id, seller_id, title_json, offer_type, discount_value, target_type, target_id, approval_status, starts_at, ends_at, active)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, 1)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
       [
         id,
         sellerId,
@@ -4395,6 +5777,7 @@ export class MarketplaceRepo {
         Math.round(input.discountValue),
         input.targetType,
         resolvedTargetId,
+        approvalStatus,
         input.startsAt ? toSqlTimestamp(new Date(input.startsAt)) : null,
         input.endsAt ? toSqlTimestamp(new Date(input.endsAt)) : null,
       ]
@@ -4404,11 +5787,2615 @@ export class MarketplaceRepo {
       action: 'seller.propose_offer',
       entityType: 'offer',
       entityId: id,
-      after: { sellerId, targetType: input.targetType, resolvedTargetId, approvalStatus: 'pending' },
+      after: { sellerId, targetType: input.targetType, resolvedTargetId, approvalStatus },
       ipAddress,
     });
     const row = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM offers WHERE id = ?', [id]);
     return this.mapOfferRow(row!);
+  }
+
+  // --- Step 5: Customer Segments, Email Block Campaigns & Automated Flows ---
+  private mapSegmentRow(row: Record<string, unknown>): CustomerSegment {
+    return {
+      id: String(row.id),
+      name: parseJson<LocalizedText>(row.name_json, { en: 'Segment', ar: 'شريحة' }),
+      description: String(row.description || ''),
+      rules: parseJson<CustomerSegmentRule>(row.rules_json, { audienceScope: 'all_contacts' }),
+      cachedMemberCount: Number(row.cached_member_count ?? 0),
+      updatedAt: String(row.updated_at),
+    };
+  }
+
+  private mapEmailCampaignRow(row: Record<string, unknown>): EmailCampaign {
+    return {
+      id: String(row.id),
+      name: String(row.name),
+      subject: parseJson<LocalizedText>(row.subject_json, { en: '', ar: '' }),
+      previewText: parseJson<LocalizedText>(row.preview_text_json, { en: '', ar: '' }),
+      segmentId: row.segment_id ? String(row.segment_id) : null,
+      blocks: parseJson<EmailBlock[]>(row.blocks_json, []),
+      status: String(row.status || 'draft') as EmailCampaignStatus,
+      scheduledAt: row.scheduled_at ? String(row.scheduled_at) : null,
+      sentCount: Number(row.sent_count ?? 0),
+      failedCount: Number(row.failed_count ?? 0),
+      unsubscribedCount: Number(row.unsubscribed_count ?? 0),
+      createdAt: String(row.created_at),
+      sentAt: row.sent_at ? String(row.sent_at) : null,
+    };
+  }
+
+  private mapAutomationFlowRow(row: Record<string, unknown>): AutomationFlow {
+    return {
+      id: String(row.id),
+      name: parseJson<LocalizedText>(row.name_json, { en: 'Automation Flow', ar: 'سير عمل تلقائي' }),
+      triggerType: String(row.trigger_type || 'welcome_subscriber') as AutomationTriggerType,
+      delayHours: Number(row.delay_hours ?? 0),
+      subject: parseJson<LocalizedText>(row.subject_json, { en: '', ar: '' }),
+      blocks: parseJson<EmailBlock[]>(row.blocks_json, []),
+      attachCouponCode: row.attach_coupon_code ? String(row.attach_coupon_code) : null,
+      active: Boolean(row.active),
+      totalTriggered: Number(row.total_triggered ?? 0),
+      totalSent: Number(row.total_sent ?? 0),
+      lastRunAt: row.last_run_at ? String(row.last_run_at) : null,
+      createdAt: String(row.created_at),
+    };
+  }
+
+  async evaluateSegmentContacts(rules: CustomerSegmentRule): Promise<SegmentContact[]> {
+    const [customerRows, orderRows, addressRows, subscriberRows] = await Promise.all([
+      this.db.query<{ id: string; name: string; email: string; preferred_locale: string }>(
+        "SELECT id, name, email, preferred_locale FROM users WHERE role_key = 'customer' AND deleted_at IS NULL AND is_blocked = 0"
+      ),
+      this.db.query<{ user_id: string; governorate: string; grand_total_usd_cents: number; created_at: string }>(
+        'SELECT user_id, governorate, grand_total_usd_cents, created_at FROM orders WHERE user_id IS NOT NULL ORDER BY created_at DESC'
+      ),
+      this.db.query<{ user_id: string; governorate: string }>(
+        'SELECT user_id, governorate FROM addresses WHERE is_default = 1'
+      ),
+      this.db.query<{ email: string; locale: string; status: string; unsubscribe_token: string }>(
+        'SELECT email, locale, status, unsubscribe_token FROM newsletter_subscribers'
+      ),
+    ]);
+
+    const orderStatsByUserId = new Map<
+      string,
+      { count: number; totalSpentUsdCents: number; latestGovernorate?: string; lastOrderAt?: string }
+    >();
+    for (const o of orderRows) {
+      const uid = String(o.user_id);
+      const prev = orderStatsByUserId.get(uid);
+      if (!prev) {
+        orderStatsByUserId.set(uid, {
+          count: 1,
+          totalSpentUsdCents: Number(o.grand_total_usd_cents || 0),
+          latestGovernorate: o.governorate ? String(o.governorate) : undefined,
+          lastOrderAt: String(o.created_at),
+        });
+      } else {
+        prev.count += 1;
+        prev.totalSpentUsdCents += Number(o.grand_total_usd_cents || 0);
+      }
+    }
+
+    const defaultGovByUserId = new Map<string, string>();
+    for (const a of addressRows) {
+      if (a.governorate) defaultGovByUserId.set(String(a.user_id), String(a.governorate));
+    }
+
+    const subByEmail = new Map<string, { locale: 'en' | 'ar'; status: string; unsubscribeToken: string }>();
+    const unsubscribedEmails = new Set<string>();
+    for (const s of subscriberRows) {
+      const emailNorm = String(s.email).trim().toLowerCase();
+      subByEmail.set(emailNorm, {
+        locale: s.locale === 'ar' ? 'ar' : 'en',
+        status: String(s.status),
+        unsubscribeToken: String(s.unsubscribe_token),
+      });
+      if (s.status === 'unsubscribed') {
+        unsubscribedEmails.add(emailNorm);
+      }
+    }
+
+    const customerByEmail = new Map<
+      string,
+      {
+        email: string;
+        name: string;
+        locale: 'en' | 'ar';
+        governorate?: string;
+        orderCount: number;
+        totalSpentUsdCents: number;
+        lastOrderAt?: string;
+      }
+    >();
+    for (const u of customerRows) {
+      const emailNorm = String(u.email).trim().toLowerCase();
+      const stats = orderStatsByUserId.get(String(u.id));
+      const gov = stats?.latestGovernorate || defaultGovByUserId.get(String(u.id));
+      customerByEmail.set(emailNorm, {
+        email: emailNorm,
+        name: String(u.name || emailNorm),
+        locale: u.preferred_locale === 'ar' ? 'ar' : 'en',
+        governorate: gov,
+        orderCount: stats?.count || 0,
+        totalSpentUsdCents: stats?.totalSpentUsdCents || 0,
+        lastOrderAt: stats?.lastOrderAt,
+      });
+    }
+
+    const contactsMap = new Map<string, SegmentContact & { _lastOrderAt?: string }>();
+
+    if (rules.audienceScope === 'registered_customers' || rules.audienceScope === 'all_contacts') {
+      for (const [emailNorm, cust] of customerByEmail.entries()) {
+        if (unsubscribedEmails.has(emailNorm)) continue;
+        const sub = subByEmail.get(emailNorm);
+        contactsMap.set(emailNorm, {
+          email: emailNorm,
+          name: cust.name,
+          locale: cust.locale,
+          governorate: cust.governorate,
+          orderCount: cust.orderCount,
+          totalSpentUsdCents: cust.totalSpentUsdCents,
+          source: 'customer',
+          unsubscribeToken: sub?.unsubscribeToken,
+          _lastOrderAt: cust.lastOrderAt,
+        });
+      }
+    }
+
+    if (rules.audienceScope === 'newsletter_subscribers' || rules.audienceScope === 'all_contacts') {
+      for (const [emailNorm, sub] of subByEmail.entries()) {
+        if (sub.status === 'unsubscribed') continue;
+        if (contactsMap.has(emailNorm)) continue;
+        const cust = customerByEmail.get(emailNorm);
+        contactsMap.set(emailNorm, {
+          email: emailNorm,
+          name: cust?.name || emailNorm.split('@')[0],
+          locale: cust?.locale || sub.locale,
+          governorate: cust?.governorate,
+          orderCount: cust?.orderCount || 0,
+          totalSpentUsdCents: cust?.totalSpentUsdCents || 0,
+          source: 'subscriber',
+          unsubscribeToken: sub.unsubscribeToken,
+          _lastOrderAt: cust?.lastOrderAt,
+        });
+      }
+    }
+
+    const nowMs = Date.now();
+    const govFilter = rules.governorate && rules.governorate !== 'all' ? rules.governorate.trim().toLowerCase() : '';
+    const minOrders = typeof rules.minOrderCount === 'number' && Number.isFinite(rules.minOrderCount) ? rules.minOrderCount : undefined;
+    const maxOrders = typeof rules.maxOrderCount === 'number' && Number.isFinite(rules.maxOrderCount) ? rules.maxOrderCount : undefined;
+    const minSpent =
+      typeof rules.minTotalSpentUsdCents === 'number' && Number.isFinite(rules.minTotalSpentUsdCents)
+        ? rules.minTotalSpentUsdCents
+        : undefined;
+    const minDaysInactive =
+      typeof rules.daysSinceLastOrder === 'number' && Number.isFinite(rules.daysSinceLastOrder) && rules.daysSinceLastOrder > 0
+        ? rules.daysSinceLastOrder
+        : undefined;
+
+    const results: SegmentContact[] = [];
+    for (const c of contactsMap.values()) {
+      if (govFilter && (c.governorate || '').toLowerCase() !== govFilter) continue;
+      if (minOrders !== undefined && c.orderCount < minOrders) continue;
+      if (maxOrders !== undefined && c.orderCount > maxOrders) continue;
+      if (minSpent !== undefined && c.totalSpentUsdCents < minSpent) continue;
+      if (rules.locale && rules.locale !== 'all' && c.locale !== rules.locale) continue;
+      if (minDaysInactive !== undefined) {
+        if (!c._lastOrderAt) continue;
+        const iso = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(c._lastOrderAt)
+          ? c._lastOrderAt.replace(' ', 'T') + 'Z'
+          : c._lastOrderAt;
+        const orderMs = new Date(iso).getTime();
+        if (Number.isNaN(orderMs)) continue;
+        const days = (nowMs - orderMs) / 86_400_000;
+        if (days < minDaysInactive) continue;
+      }
+      const { _lastOrderAt: _drop, ...clean } = c;
+      results.push(clean);
+    }
+
+    return results;
+  }
+
+  async adminListSegments(): Promise<CustomerSegment[]> {
+    const rows = await this.db.query<Record<string, unknown>>('SELECT * FROM customer_segments ORDER BY updated_at DESC');
+    return rows.map((r) => this.mapSegmentRow(r));
+  }
+
+  async adminPreviewSegment(rules: CustomerSegmentRule): Promise<{ count: number; contacts: SegmentContact[] }> {
+    const contacts = await this.evaluateSegmentContacts(rules);
+    return { count: contacts.length, contacts: contacts.slice(0, 50) };
+  }
+
+  async adminCreateSegment(
+    actorUserId: string,
+    input: { name: LocalizedText; description?: string; rules: CustomerSegmentRule },
+    ipAddress?: string
+  ): Promise<CustomerSegment> {
+    const contacts = await this.evaluateSegmentContacts(input.rules);
+    const id = `seg-${crypto.randomUUID()}`;
+    const now = toSqlTimestamp();
+    await this.db.execute(
+      `INSERT INTO customer_segments (id, name_json, description, rules_json, cached_member_count, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [id, JSON.stringify(input.name), (input.description || '').trim().slice(0, 400), JSON.stringify(input.rules), contacts.length, now]
+    );
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.create_segment',
+      entityType: 'customer_segment',
+      entityId: id,
+      after: { name: input.name.en, memberCount: contacts.length, rules: input.rules },
+      ipAddress,
+    });
+    const row = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM customer_segments WHERE id = ?', [id]);
+    return this.mapSegmentRow(row!);
+  }
+
+  async adminDeleteSegment(id: string, actorUserId: string, ipAddress?: string): Promise<void> {
+    await this.db.execute('DELETE FROM customer_segments WHERE id = ?', [id]);
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.delete_segment',
+      entityType: 'customer_segment',
+      entityId: id,
+      ipAddress,
+    });
+  }
+
+  async adminListEmailCampaigns(): Promise<EmailCampaign[]> {
+    const rows = await this.db.query<Record<string, unknown>>('SELECT * FROM email_campaigns ORDER BY created_at DESC');
+    return rows.map((r) => this.mapEmailCampaignRow(r));
+  }
+
+  async adminCreateEmailCampaign(
+    actorUserId: string,
+    input: {
+      name: string;
+      subject: LocalizedText;
+      previewText?: LocalizedText;
+      segmentId?: string | null;
+      blocks: EmailBlock[];
+      scheduledAt?: string | null;
+    },
+    ipAddress?: string
+  ): Promise<EmailCampaign> {
+    const id = `ecmp-${crypto.randomUUID()}`;
+    const now = toSqlTimestamp();
+    const scheduledSql = input.scheduledAt ? toSqlTimestamp(new Date(input.scheduledAt)) : null;
+    const status: EmailCampaignStatus = scheduledSql ? 'scheduled' : 'draft';
+    await this.db.execute(
+      `INSERT INTO email_campaigns (id, name, subject_json, preview_text_json, segment_id, blocks_json, status, scheduled_at, sent_count, failed_count, unsubscribed_count, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?)`,
+      [
+        id,
+        input.name.trim().slice(0, 160),
+        JSON.stringify(input.subject),
+        JSON.stringify(input.previewText || { en: '', ar: '' }),
+        input.segmentId || null,
+        JSON.stringify(input.blocks),
+        status,
+        scheduledSql,
+        now,
+      ]
+    );
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.create_email_campaign',
+      entityType: 'email_campaign',
+      entityId: id,
+      after: { name: input.name, status, blockCount: input.blocks.length },
+      ipAddress,
+    });
+    const row = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM email_campaigns WHERE id = ?', [id]);
+    return this.mapEmailCampaignRow(row!);
+  }
+
+  async adminDeleteEmailCampaign(id: string, actorUserId: string, ipAddress?: string): Promise<void> {
+    await this.db.execute('DELETE FROM email_campaigns WHERE id = ?', [id]);
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.delete_email_campaign',
+      entityType: 'email_campaign',
+      entityId: id,
+      ipAddress,
+    });
+  }
+
+  async enqueueEmailCampaignRecipients(campaignId: string): Promise<number> {
+    const row = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM email_campaigns WHERE id = ?', [campaignId]);
+    if (!row) throw new Error('Email campaign not found.');
+    const campaign = this.mapEmailCampaignRow(row);
+
+    let rules: CustomerSegmentRule = { audienceScope: 'all_contacts' };
+    if (campaign.segmentId) {
+      const segRow = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM customer_segments WHERE id = ?', [
+        campaign.segmentId,
+      ]);
+      if (segRow) {
+        rules = parseJson<CustomerSegmentRule>(segRow.rules_json, rules);
+      }
+    }
+
+    const contacts = await this.evaluateSegmentContacts(rules);
+    if (campaign.segmentId) {
+      await this.db.execute('UPDATE customer_segments SET cached_member_count = ?, updated_at = ? WHERE id = ?', [
+        contacts.length,
+        toSqlTimestamp(),
+        campaign.segmentId,
+      ]);
+    }
+
+    const now = toSqlTimestamp();
+    if (contacts.length === 0) {
+      await this.db.execute("UPDATE email_campaigns SET status = 'sent', sent_at = COALESCE(sent_at, ?) WHERE id = ?", [
+        now,
+        campaign.id,
+      ]);
+      return 0;
+    }
+
+    await this.db.execute("UPDATE email_campaigns SET status = 'queued', sent_at = COALESCE(sent_at, ?) WHERE id = ?", [
+      now,
+      campaign.id,
+    ]);
+
+    for (const c of contacts) {
+      const locale = c.locale === 'ar' ? 'ar' : 'en';
+      const subject = (locale === 'ar' ? campaign.subject.ar : campaign.subject.en) || campaign.subject.en || campaign.name;
+      const previewText =
+        (locale === 'ar' ? campaign.previewText.ar : campaign.previewText.en) || campaign.previewText.en || '';
+      const payload: MarketingEmailJobPayload = {
+        campaignId: campaign.id,
+        to: c.email,
+        locale,
+        subject,
+        previewText,
+        blocks: campaign.blocks,
+        unsubscribeToken: c.unsubscribeToken || null,
+      };
+      await enqueueJob(this.db, 'send_marketing_email', payload as unknown as Record<string, unknown>);
+    }
+
+    return contacts.length;
+  }
+
+  async adminSendOrScheduleEmailCampaign(
+    id: string,
+    actorUserId: string,
+    opts: { sendNow?: boolean; scheduledAt?: string | null },
+    ipAddress?: string
+  ): Promise<{ campaign: EmailCampaign; queuedCount: number }> {
+    const existing = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM email_campaigns WHERE id = ?', [id]);
+    if (!existing) throw new Error('Email campaign not found.');
+
+    let queuedCount = 0;
+    if (opts.sendNow) {
+      queuedCount = await this.enqueueEmailCampaignRecipients(id);
+    } else if (opts.scheduledAt) {
+      await this.db.execute("UPDATE email_campaigns SET status = 'scheduled', scheduled_at = ? WHERE id = ?", [
+        toSqlTimestamp(new Date(opts.scheduledAt)),
+        id,
+      ]);
+    }
+
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: opts.sendNow ? 'admin.send_email_campaign' : 'admin.schedule_email_campaign',
+      entityType: 'email_campaign',
+      entityId: id,
+      after: { queuedCount, scheduledAt: opts.scheduledAt || null },
+      ipAddress,
+    });
+
+    const updated = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM email_campaigns WHERE id = ?', [id]);
+    return { campaign: this.mapEmailCampaignRow(updated!), queuedCount };
+  }
+
+  async adminListAutomationFlows(): Promise<AutomationFlow[]> {
+    const rows = await this.db.query<Record<string, unknown>>('SELECT * FROM automation_flows ORDER BY created_at DESC');
+    return rows.map((r) => this.mapAutomationFlowRow(r));
+  }
+
+  async adminCreateAutomationFlow(
+    actorUserId: string,
+    input: {
+      name: LocalizedText;
+      triggerType: AutomationTriggerType;
+      delayHours: number;
+      subject: LocalizedText;
+      blocks: EmailBlock[];
+      attachCouponCode?: string | null;
+      active?: boolean;
+    },
+    ipAddress?: string
+  ): Promise<AutomationFlow> {
+    const id = `flow-${crypto.randomUUID()}`;
+    const now = toSqlTimestamp();
+    await this.db.execute(
+      `INSERT INTO automation_flows (id, name_json, trigger_type, delay_hours, subject_json, blocks_json, attach_coupon_code, active, total_triggered, total_sent, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)`,
+      [
+        id,
+        JSON.stringify(input.name),
+        input.triggerType,
+        Math.max(0, Math.round(input.delayHours)),
+        JSON.stringify(input.subject),
+        JSON.stringify(input.blocks),
+        input.attachCouponCode ? input.attachCouponCode.trim().toUpperCase() : null,
+        input.active === false ? 0 : 1,
+        now,
+      ]
+    );
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.create_automation_flow',
+      entityType: 'automation_flow',
+      entityId: id,
+      after: { triggerType: input.triggerType, delayHours: input.delayHours, active: input.active !== false },
+      ipAddress,
+    });
+    const row = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM automation_flows WHERE id = ?', [id]);
+    return this.mapAutomationFlowRow(row!);
+  }
+
+  async adminUpdateAutomationFlow(
+    id: string,
+    actorUserId: string,
+    patch: Partial<{
+      name: LocalizedText;
+      delayHours: number;
+      subject: LocalizedText;
+      blocks: EmailBlock[];
+      attachCouponCode: string | null;
+      active: boolean;
+    }>,
+    ipAddress?: string
+  ): Promise<AutomationFlow> {
+    const existingRow = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM automation_flows WHERE id = ?', [id]);
+    if (!existingRow) throw new Error('Automation flow not found.');
+    const existing = this.mapAutomationFlowRow(existingRow);
+
+    await this.db.execute(
+      `UPDATE automation_flows SET name_json = ?, delay_hours = ?, subject_json = ?, blocks_json = ?, attach_coupon_code = ?, active = ? WHERE id = ?`,
+      [
+        JSON.stringify(patch.name ?? existing.name),
+        patch.delayHours !== undefined ? Math.max(0, Math.round(patch.delayHours)) : existing.delayHours,
+        JSON.stringify(patch.subject ?? existing.subject),
+        JSON.stringify(patch.blocks ?? existing.blocks),
+        patch.attachCouponCode !== undefined
+          ? patch.attachCouponCode
+            ? patch.attachCouponCode.trim().toUpperCase()
+            : null
+          : existing.attachCouponCode ?? null,
+        patch.active !== undefined ? (patch.active ? 1 : 0) : existing.active ? 1 : 0,
+        id,
+      ]
+    );
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.update_automation_flow',
+      entityType: 'automation_flow',
+      entityId: id,
+      after: patch,
+      ipAddress,
+    });
+    const row = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM automation_flows WHERE id = ?', [id]);
+    return this.mapAutomationFlowRow(row!);
+  }
+
+  async adminDeleteAutomationFlow(id: string, actorUserId: string, ipAddress?: string): Promise<void> {
+    await this.db.execute('DELETE FROM automation_executions WHERE flow_id = ?', [id]);
+    await this.db.execute('DELETE FROM automation_flows WHERE id = ?', [id]);
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.delete_automation_flow',
+      entityType: 'automation_flow',
+      entityId: id,
+      ipAddress,
+    });
+  }
+
+  // --- Step 6: Seller Promotion Rules & Marketing Attribution Analytics ---
+  async getSellerPromoRules(): Promise<SellerPromoRules> {
+    const kCol = this.db.driver === 'mysql' ? '`key`' : 'key';
+    const row = await this.db.queryOne<{ value_json: string; updated_at: string }>(
+      `SELECT value_json, updated_at FROM settings WHERE ${kCol} = 'seller_promo_rules'`
+    );
+    const parsed = row ? parseJson<Partial<SellerPromoRules>>(row.value_json, {}) : {};
+    return {
+      sellerOffersEnabled: parsed.sellerOffersEnabled !== undefined ? Boolean(parsed.sellerOffersEnabled) : true,
+      requireAdminApproval: parsed.requireAdminApproval !== undefined ? Boolean(parsed.requireAdminApproval) : true,
+      maxDiscountPercent: Math.max(5, Math.min(90, Math.round(Number(parsed.maxDiscountPercent ?? 60)))),
+      maxFixedDiscountUsdCents: Math.max(500, Math.round(Number(parsed.maxFixedDiscountUsdCents ?? 15000))),
+      maxActiveOffersPerSeller: Math.max(1, Math.min(50, Math.round(Number(parsed.maxActiveOffersPerSeller ?? 5)))),
+      allowFlashOffersBySellers:
+        parsed.allowFlashOffersBySellers !== undefined ? Boolean(parsed.allowFlashOffersBySellers) : true,
+      updatedAt: String(row?.updated_at || toSqlTimestamp()),
+    };
+  }
+
+  async adminUpdateSellerPromoRules(
+    actorUserId: string,
+    patch: Partial<Omit<SellerPromoRules, 'updatedAt'>>,
+    ipAddress?: string
+  ): Promise<SellerPromoRules> {
+    const current = await this.getSellerPromoRules();
+    const next: SellerPromoRules = {
+      sellerOffersEnabled: patch.sellerOffersEnabled ?? current.sellerOffersEnabled,
+      requireAdminApproval: patch.requireAdminApproval ?? current.requireAdminApproval,
+      maxDiscountPercent: Math.max(5, Math.min(90, Math.round(Number(patch.maxDiscountPercent ?? current.maxDiscountPercent)))),
+      maxFixedDiscountUsdCents: Math.max(
+        500,
+        Math.round(Number(patch.maxFixedDiscountUsdCents ?? current.maxFixedDiscountUsdCents))
+      ),
+      maxActiveOffersPerSeller: Math.max(
+        1,
+        Math.min(50, Math.round(Number(patch.maxActiveOffersPerSeller ?? current.maxActiveOffersPerSeller)))
+      ),
+      allowFlashOffersBySellers: patch.allowFlashOffersBySellers ?? current.allowFlashOffersBySellers,
+      updatedAt: toSqlTimestamp(),
+    };
+    const kCol = this.db.driver === 'mysql' ? '`key`' : 'key';
+    const jsonVal = JSON.stringify(next);
+    await this.db.execute(
+      this.db.driver === 'mysql'
+        ? `INSERT INTO settings (${kCol}, value_json, updated_at) VALUES ('seller_promo_rules', ?, ?) ON DUPLICATE KEY UPDATE value_json = VALUES(value_json), updated_at = VALUES(updated_at)`
+        : `INSERT INTO settings (${kCol}, value_json, updated_at) VALUES ('seller_promo_rules', ?, ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
+      [jsonVal, next.updatedAt]
+    );
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.update_seller_promo_rules',
+      entityType: 'settings',
+      entityId: 'seller_promo_rules',
+      before: current,
+      after: next,
+      ipAddress,
+    });
+    return next;
+  }
+
+  async getMarketingAnalytics(): Promise<MarketingAnalyticsSummary> {
+    const [
+      orderRows,
+      orderItemRows,
+      couponRows,
+      offersList,
+      flashSalesList,
+      campaignsList,
+      bannersList,
+      popupsList,
+      featuredList,
+      emailCampaignsList,
+      flowsList,
+    ] = await Promise.all([
+      this.db.query<{
+        id: string;
+        coupon_code: string | null;
+        discount_total_usd_cents: number;
+        grand_total_usd_cents: number;
+      }>('SELECT id, coupon_code, discount_total_usd_cents, grand_total_usd_cents FROM orders'),
+      this.db.query<{
+        order_id: string;
+        product_id: string;
+        seller_id: string;
+        line_total_usd_cents: number;
+      }>(
+        `SELECT so.order_id, oi.product_id, so.seller_id, oi.line_total_usd_cents
+         FROM order_items oi
+         INNER JOIN sub_orders so ON so.id = oi.sub_order_id`
+      ),
+      this.db.query<Record<string, unknown>>('SELECT * FROM coupons ORDER BY used_count DESC, code ASC'),
+      this.adminListOffers(),
+      this.adminListFlashSales(),
+      this.adminListCampaigns(),
+      this.adminListBanners(),
+      this.adminListPopups(),
+      this.adminListFeaturedPlacements(),
+      this.adminListEmailCampaigns(),
+      this.adminListAutomationFlows(),
+    ]);
+
+    const coupons = couponRows.map((c) => this.mapCouponRow(c));
+
+    // Build product/seller -> order mapping for attribution
+    const orderItemsByOrderId = new Map<string, Array<{ productId: string; sellerId: string; lineTotalUsdCents: number }>>();
+    for (const oi of orderItemRows) {
+      const list = orderItemsByOrderId.get(oi.order_id) || [];
+      list.push({
+        productId: String(oi.product_id),
+        sellerId: String(oi.seller_id),
+        lineTotalUsdCents: Number(oi.line_total_usd_cents || 0),
+      });
+      orderItemsByOrderId.set(oi.order_id, list);
+    }
+
+    const activeOfferTargets = new Set<string>();
+    const offerTargetById = new Map<string, { targetType: string; targetId?: string | null; sellerId?: string | null }>();
+    for (const off of offersList) {
+      offerTargetById.set(off.id, { targetType: off.targetType, targetId: off.targetId, sellerId: off.sellerId });
+      if (off.approvalStatus === 'approved' && off.active) {
+        if (off.targetId) activeOfferTargets.add(`${off.targetType}:${off.targetId}`);
+        else if (off.targetType === 'all') activeOfferTargets.add('all');
+      }
+    }
+
+    const flashProductIds = new Set<string>();
+    const flashProductsBySaleId = new Map<string, Set<string>>();
+    for (const fs of flashSalesList) {
+      const s = new Set<string>();
+      for (const item of fs.items) {
+        flashProductIds.add(item.productId);
+        s.add(item.productId);
+      }
+      flashProductsBySaleId.set(fs.id, s);
+    }
+
+    let totalOrderGmvUsdCents = 0;
+    let promoAttributedGmvUsdCents = 0;
+    let totalDiscountsGrantedUsdCents = 0;
+    let couponOrdersCount = 0;
+
+    const ordersByCoupon = new Map<string, { ordersCount: number; revenueUsdCents: number; discountUsdCents: number }>();
+
+    for (const o of orderRows) {
+      const grand = Number(o.grand_total_usd_cents || 0);
+      const disc = Number(o.discount_total_usd_cents || 0);
+      const code = o.coupon_code ? String(o.coupon_code).trim().toUpperCase() : '';
+      totalOrderGmvUsdCents += grand;
+      totalDiscountsGrantedUsdCents += disc;
+
+      if (code) {
+        couponOrdersCount += 1;
+        const prev = ordersByCoupon.get(code) || { ordersCount: 0, revenueUsdCents: 0, discountUsdCents: 0 };
+        prev.ordersCount += 1;
+        prev.revenueUsdCents += grand;
+        prev.discountUsdCents += disc;
+        ordersByCoupon.set(code, prev);
+      }
+
+      const items = orderItemsByOrderId.get(o.id) || [];
+      const hasFlashItem = items.some((it) => flashProductIds.has(it.productId));
+      const hasOfferItem =
+        activeOfferTargets.has('all') ||
+        items.some(
+          (it) =>
+            activeOfferTargets.has(`product:${it.productId}`) || activeOfferTargets.has(`seller:${it.sellerId}`)
+        );
+
+      if (code || disc > 0 || hasFlashItem || hasOfferItem) {
+        promoAttributedGmvUsdCents += grand;
+      }
+    }
+
+    const couponAttribution = coupons.map((c) => {
+      const stats = ordersByCoupon.get(c.code.toUpperCase()) || {
+        ordersCount: 0,
+        revenueUsdCents: 0,
+        discountUsdCents: 0,
+      };
+      return {
+        code: c.code,
+        discountType: c.discountType,
+        discountValue: c.discountValue,
+        usedCount: c.usedCount,
+        maxUses: c.maxUses ?? null,
+        ordersCount: stats.ordersCount,
+        revenueUsdCents: stats.revenueUsdCents,
+        discountUsdCents: stats.discountUsdCents,
+      };
+    });
+
+    const campaignAttribution = campaignsList.map((cmp) => {
+      const couponSet = new Set(cmp.featuredCouponCodes.map((c) => c.toUpperCase()));
+      const flashSet = cmp.featuredFlashSaleId ? flashProductsBySaleId.get(cmp.featuredFlashSaleId) || new Set<string>() : new Set<string>();
+      const offerTargets = cmp.featuredOfferIds.map((oid) => offerTargetById.get(oid)).filter(Boolean);
+
+      let ordersCount = 0;
+      let revenueUsdCents = 0;
+      let discountUsdCents = 0;
+      for (const o of orderRows) {
+        const code = o.coupon_code ? String(o.coupon_code).trim().toUpperCase() : '';
+        const items = orderItemsByOrderId.get(o.id) || [];
+        const matchedCoupon = Boolean(code && couponSet.has(code));
+        const matchedFlash = items.some((it) => flashSet.has(it.productId));
+        const matchedOffer = offerTargets.some(
+          (ot) =>
+            ot!.targetType === 'all' ||
+            items.some(
+              (it) =>
+                (ot!.targetType === 'product' && it.productId === ot!.targetId) ||
+                (ot!.targetType === 'seller' && it.sellerId === ot!.targetId)
+            )
+        );
+        if (matchedCoupon || matchedFlash || matchedOffer) {
+          ordersCount += 1;
+          revenueUsdCents += Number(o.grand_total_usd_cents || 0);
+          discountUsdCents += Number(o.discount_total_usd_cents || 0);
+        }
+      }
+
+      return {
+        id: cmp.id,
+        slug: cmp.slug,
+        title: cmp.title,
+        status: cmp.status,
+        ordersCount,
+        revenueUsdCents,
+        discountUsdCents,
+      };
+    });
+
+    const flashSalePerformance = flashSalesList.map((fs) => ({
+      id: fs.id,
+      slug: fs.slug,
+      title: fs.title,
+      status: fs.status,
+      itemsCount: fs.items.length,
+      soldCount: fs.items.reduce((s, it) => s + it.claimedCount, 0),
+      stockCapTotal: fs.items.reduce((s, it) => s + it.stockCap, 0),
+      estimatedRevenueUsdCents: fs.items.reduce((s, it) => s + it.salePriceUsdCents * it.claimedCount, 0),
+    }));
+
+    const bannerImpressions = bannersList.reduce((s, b) => s + b.impressions, 0);
+    const bannerClicks = bannersList.reduce((s, b) => s + b.clicks, 0);
+    const bannerBotFiltered = bannersList.reduce((s, b) => s + (b.botFilteredCount ?? 0), 0);
+    const bannerCtrBps = bannerImpressions > 0 ? Math.round((bannerClicks * 10000) / bannerImpressions) : 0;
+
+    const popupImpressions = popupsList.reduce((s, p) => s + p.impressions, 0);
+    const popupConversions = popupsList.reduce((s, p) => s + p.conversions, 0);
+    const popupDismissals = popupsList.reduce((s, p) => s + p.dismissals, 0);
+    const popupConversionBps = popupImpressions > 0 ? Math.round((popupConversions * 10000) / popupImpressions) : 0;
+
+    const emailDeliveredCount =
+      emailCampaignsList.reduce((s, c) => s + c.sentCount, 0) + flowsList.reduce((s, f) => s + f.totalSent, 0);
+    const emailFailedCount = emailCampaignsList.reduce((s, c) => s + c.failedCount, 0);
+    const emailUnsubscribedSkipped = emailCampaignsList.reduce((s, c) => s + c.unsubscribedCount, 0);
+
+    return {
+      kpis: {
+        totalOrderGmvUsdCents,
+        promoAttributedGmvUsdCents,
+        totalDiscountsGrantedUsdCents,
+        couponOrdersCount,
+        bannerImpressions,
+        bannerClicks,
+        bannerBotFiltered,
+        bannerCtrBps,
+        popupImpressions,
+        popupConversions,
+        popupDismissals,
+        popupConversionBps,
+        emailDeliveredCount,
+        emailFailedCount,
+        emailUnsubscribedSkipped,
+      },
+      couponAttribution,
+      campaignAttribution,
+      flashSalePerformance,
+      placementsTelemetry: {
+        banners: bannersList.map((b) => ({
+          id: b.id,
+          title: b.title,
+          placement: b.placement,
+          impressions: b.impressions,
+          clicks: b.clicks,
+          botFilteredCount: b.botFilteredCount ?? 0,
+          ctrBps: b.impressions > 0 ? Math.round((b.clicks * 10000) / b.impressions) : 0,
+        })),
+        popups: popupsList.map((p) => ({
+          id: p.id,
+          title: p.title,
+          popupType: p.popupType,
+          impressions: p.impressions,
+          conversions: p.conversions,
+          dismissals: p.dismissals,
+          conversionBps: p.impressions > 0 ? Math.round((p.conversions * 10000) / p.impressions) : 0,
+        })),
+        featuredSlots: featuredList.map((f) => ({
+          id: f.id,
+          slotKey: f.slotKey,
+          targetType: f.targetType,
+          impressions: f.impressions,
+          clicks: f.clicks,
+          ctrBps: f.impressions > 0 ? Math.round((f.clicks * 10000) / f.impressions) : 0,
+        })),
+      },
+      emailPerformance: {
+        campaigns: emailCampaignsList.map((c) => ({
+          id: c.id,
+          name: c.name,
+          status: c.status,
+          sentCount: c.sentCount,
+          failedCount: c.failedCount,
+          unsubscribedCount: c.unsubscribedCount,
+        })),
+        automations: flowsList.map((f) => ({
+          id: f.id,
+          name: f.name,
+          triggerType: f.triggerType,
+          active: f.active,
+          totalTriggered: f.totalTriggered,
+          totalSent: f.totalSent,
+        })),
+      },
+    };
+  }
+
+  // =========================================================================
+  // PHASE C: Customer Auth, Addresses, Notifications, Cases, Support,
+  //          Seller Catalog/Staff/Logistics, & Admin Moderation/Operations
+  // =========================================================================
+
+  async getBrands(): Promise<BrandItem[]> {
+    const rows = await this.db.query<{ id: string; slug: string; name_json: string; active: number | boolean }>(
+      'SELECT id, slug, name_json, active FROM brands WHERE active = 1 ORDER BY slug ASC'
+    );
+    return rows.map((r) => ({
+      id: r.id,
+      slug: r.slug,
+      name: parseJson<LocalizedText>(r.name_json, { en: r.slug, ar: r.slug }),
+      active: Boolean(r.active),
+    }));
+  }
+
+  async getAttributes(): Promise<AttributeItem[]> {
+    const rows = await this.db.query<{ id: string; code: string; name_json: string; values_json: string }>(
+      'SELECT id, code, name_json, values_json FROM attributes ORDER BY code ASC'
+    );
+    return rows.map((r) => ({
+      id: r.id,
+      code: r.code,
+      name: parseJson<LocalizedText>(r.name_json, { en: r.code, ar: r.code }),
+      values: parseJson<string[]>(r.values_json, []),
+    }));
+  }
+
+  async createNotification(txOrDb: DbTx, userId: string, title: LocalizedText, body: LocalizedText): Promise<void> {
+    await txOrDb.execute(
+      'INSERT INTO notifications (id, user_id, title_json, body_json, read_at, created_at) VALUES (?, ?, ?, ?, NULL, ?)',
+      [`ntf-${crypto.randomUUID()}`, userId, JSON.stringify(title), JSON.stringify(body), toSqlTimestamp()]
+    );
+  }
+
+  async getUserNotifications(userId: string): Promise<NotificationItem[]> {
+    const rows = await this.db.query<{
+      id: string;
+      user_id: string;
+      title_json: string;
+      body_json: string;
+      read_at: string | null;
+      created_at: string;
+    }>('SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 60', [userId]);
+
+    return rows.map((r) => ({
+      id: r.id,
+      userId: r.user_id,
+      title: parseJson<LocalizedText>(r.title_json, { en: '', ar: '' }),
+      body: parseJson<LocalizedText>(r.body_json, { en: '', ar: '' }),
+      readAt: r.read_at ? String(r.read_at) : null,
+      createdAt: String(r.created_at),
+    }));
+  }
+
+  async markNotificationRead(userId: string, idOrAll: string): Promise<{ updated: number }> {
+    const now = toSqlTimestamp();
+    if (idOrAll === 'all') {
+      const res = await this.db.execute(
+        'UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL',
+        [now, userId]
+      );
+      return { updated: res.affectedRows };
+    }
+    const res = await this.db.execute(
+      'UPDATE notifications SET read_at = ? WHERE id = ? AND user_id = ? AND read_at IS NULL',
+      [now, idOrAll, userId]
+    );
+    return { updated: res.affectedRows };
+  }
+
+  async requestPasswordReset(email: string, ipAddress?: string): Promise<{ ok: boolean; devResetToken?: string }> {
+    const emailNorm = email.trim().toLowerCase();
+    const user = await this.db.queryOne<{
+      id: string;
+      name: string;
+      email: string;
+      preferred_locale: string;
+      deleted_at: string | null;
+      is_blocked: number | boolean;
+    }>('SELECT id, name, email, preferred_locale, deleted_at, is_blocked FROM users WHERE LOWER(email) = ? LIMIT 1', [
+      emailNorm,
+    ]);
+
+    if (!user || user.deleted_at || user.is_blocked) {
+      return { ok: true };
+    }
+
+    const rawToken = crypto.randomBytes(24).toString('hex');
+    const tokenHash = sha256Hex(rawToken);
+    const now = toSqlTimestamp();
+    const expiresAt = toSqlTimestamp(new Date(Date.now() + 60 * 60_000));
+
+    await this.db.transaction(async (tx) => {
+      await tx.execute(
+        `INSERT INTO password_resets (id, user_id, token_hash, purpose, expires_at, used_at, created_at)
+         VALUES (?, ?, ?, 'password_reset', ?, NULL, ?)`,
+        [`pwr-${crypto.randomUUID()}`, user.id, tokenHash, expiresAt, now]
+      );
+
+      await queueEmail(tx, {
+        to: user.email,
+        templateKey: 'password_reset',
+        locale: user.preferred_locale === 'ar' ? 'ar' : 'en',
+        vars: {
+          name: user.name,
+          token: rawToken,
+          link: `/account?resetToken=${rawToken}`,
+        },
+      });
+
+      await writeAuditLog(tx, {
+        actorUserId: user.id,
+        action: 'auth.password_reset_requested',
+        entityType: 'user',
+        entityId: user.id,
+        ipAddress,
+      });
+    });
+
+    const isProd = process.env.NODE_ENV === 'production';
+    const hasSmtp = Boolean(process.env.SMTP_HOST?.trim() && process.env.SMTP_USER?.trim() && process.env.SMTP_PASS?.trim());
+    return !isProd && !hasSmtp ? { ok: true, devResetToken: rawToken } : { ok: true };
+  }
+
+  async confirmPasswordReset(token: string, newPassword: string, ipAddress?: string): Promise<{ ok: boolean }> {
+    const pwErr = validatePasswordStrength(newPassword);
+    if (pwErr) throw new Error(pwErr);
+
+    const tokenHash = sha256Hex(token.trim());
+    const now = toSqlTimestamp();
+
+    return this.db.transaction(async (tx) => {
+      const resetRow = await tx.queryOne<{
+        id: string;
+        user_id: string;
+        expires_at: string;
+        used_at: string | null;
+      }>(
+        "SELECT id, user_id, expires_at, used_at FROM password_resets WHERE token_hash = ? AND purpose = 'password_reset' LIMIT 1",
+        [tokenHash]
+      );
+
+      if (!resetRow || resetRow.used_at || String(resetRow.expires_at) <= now) {
+        throw new Error('Password reset token is invalid or expired.');
+      }
+
+      await tx.execute(
+        'UPDATE users SET password_hash = ?, failed_login_attempts = 0, locked_until = NULL, updated_at = ? WHERE id = ?',
+        [hashPassword(newPassword), now, resetRow.user_id]
+      );
+      await tx.execute('UPDATE password_resets SET used_at = ? WHERE id = ?', [now, resetRow.id]);
+      await tx.execute('DELETE FROM sessions WHERE user_id = ?', [resetRow.user_id]);
+
+      await writeAuditLog(tx, {
+        actorUserId: resetRow.user_id,
+        action: 'auth.password_reset_completed',
+        entityType: 'user',
+        entityId: resetRow.user_id,
+        ipAddress,
+      });
+
+      return { ok: true };
+    });
+  }
+
+  async updateAccountProfile(
+    userId: string,
+    patch: { name?: string; phone?: string; preferredLocale?: 'en' | 'ar'; preferredCurrency?: 'USD' | 'LBP' }
+  ) {
+    const curr = await this.db.queryOne<{
+      name: string;
+      phone: string;
+      preferred_locale: string;
+      preferred_currency: string;
+    }>('SELECT name, phone, preferred_locale, preferred_currency FROM users WHERE id = ?', [userId]);
+    if (!curr) throw new Error('User not found.');
+
+    const nextName = patch.name !== undefined ? patch.name.trim() : curr.name;
+    const nextPhone = patch.phone !== undefined ? patch.phone.trim() : curr.phone;
+    const nextLocale = patch.preferredLocale || (curr.preferred_locale === 'ar' ? 'ar' : 'en');
+    const nextCurr = patch.preferredCurrency || (curr.preferred_currency === 'LBP' ? 'LBP' : 'USD');
+
+    await this.db.execute(
+      'UPDATE users SET name = ?, phone = ?, preferred_locale = ?, preferred_currency = ?, updated_at = ? WHERE id = ?',
+      [nextName, nextPhone, nextLocale, nextCurr, toSqlTimestamp(), userId]
+    );
+
+    return {
+      name: nextName,
+      phone: nextPhone,
+      preferredLocale: nextLocale as 'en' | 'ar',
+      preferredCurrency: nextCurr as 'USD' | 'LBP',
+    };
+  }
+
+  async getUserAddresses(userId: string): Promise<CustomerAddress[]> {
+    const rows = await this.db.query<Record<string, unknown>>(
+      'SELECT * FROM addresses WHERE user_id = ? ORDER BY is_default DESC, id DESC',
+      [userId]
+    );
+    return rows.map((r) => ({
+      id: String(r.id),
+      userId: String(r.user_id),
+      label: String(r.label),
+      governorate: String(r.governorate),
+      district: String(r.district),
+      town: String(r.town),
+      phone: String(r.phone),
+      notes: r.notes ? String(r.notes) : '',
+      isDefault: Boolean(r.is_default),
+    }));
+  }
+
+  async createUserAddress(
+    userId: string,
+    input: { label: string; governorate: string; district: string; town: string; phone: string; notes?: string; isDefault?: boolean }
+  ): Promise<CustomerAddress> {
+    const id = `adr-${crypto.randomUUID()}`;
+    return this.db.transaction(async (tx) => {
+      if (input.isDefault) {
+        await tx.execute('UPDATE addresses SET is_default = 0 WHERE user_id = ?', [userId]);
+      } else {
+        const cntRow = await tx.queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM addresses WHERE user_id = ?', [userId]);
+        if (Number(cntRow?.cnt ?? 0) === 0) input.isDefault = true;
+      }
+
+      await tx.execute(
+        `INSERT INTO addresses (id, user_id, label, governorate, district, town, phone, notes, is_default)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          id,
+          userId,
+          input.label.trim(),
+          input.governorate,
+          input.district,
+          input.town.trim(),
+          input.phone.trim(),
+          (input.notes || '').trim(),
+          input.isDefault ? 1 : 0,
+        ]
+      );
+
+      return {
+        id,
+        userId,
+        label: input.label.trim(),
+        governorate: input.governorate,
+        district: input.district,
+        town: input.town.trim(),
+        phone: input.phone.trim(),
+        notes: (input.notes || '').trim(),
+        isDefault: Boolean(input.isDefault),
+      };
+    });
+  }
+
+  async updateUserAddress(
+    userId: string,
+    addressId: string,
+    patch: Partial<{ label: string; governorate: string; district: string; town: string; phone: string; notes: string; isDefault: boolean }>
+  ): Promise<CustomerAddress> {
+    return this.db.transaction(async (tx) => {
+      const existing = await tx.queryOne<Record<string, unknown>>(
+        'SELECT * FROM addresses WHERE id = ? AND user_id = ?',
+        [addressId, userId]
+      );
+      if (!existing) throw new Error('Address not found.');
+      if (patch.isDefault) {
+        await tx.execute('UPDATE addresses SET is_default = 0 WHERE user_id = ?', [userId]);
+      }
+
+      const next = {
+        label: patch.label !== undefined ? patch.label.trim() : String(existing.label),
+        governorate: patch.governorate !== undefined ? patch.governorate : String(existing.governorate),
+        district: patch.district !== undefined ? patch.district : String(existing.district),
+        town: patch.town !== undefined ? patch.town.trim() : String(existing.town),
+        phone: patch.phone !== undefined ? patch.phone.trim() : String(existing.phone),
+        notes: patch.notes !== undefined ? patch.notes.trim() : String(existing.notes || ''),
+        isDefault: patch.isDefault !== undefined ? patch.isDefault : Boolean(existing.is_default),
+      };
+
+      await tx.execute(
+        `UPDATE addresses SET label = ?, governorate = ?, district = ?, town = ?, phone = ?, notes = ?, is_default = ?
+         WHERE id = ? AND user_id = ?`,
+        [next.label, next.governorate, next.district, next.town, next.phone, next.notes, next.isDefault ? 1 : 0, addressId, userId]
+      );
+
+      return { id: addressId, userId, ...next };
+    });
+  }
+
+  async deleteUserAddress(userId: string, addressId: string): Promise<void> {
+    await this.db.execute('DELETE FROM addresses WHERE id = ? AND user_id = ?', [addressId, userId]);
+  }
+
+  private async verifySubOrderOwnership(
+    tx: DbTx,
+    subOrderId: string,
+    opts: { userId?: string | null; orderNumber?: string; phone?: string }
+  ) {
+    const row = await tx.queryOne<{
+      sub_id: string;
+      seller_id: string;
+      subtotal_usd_cents: number;
+      discount_usd_cents: number;
+      order_id: string;
+      order_number: string;
+      order_user_id: string | null;
+      customer_phone: string;
+      owner_user_id: string;
+    }>(
+      `SELECT so.id AS sub_id, so.seller_id, so.subtotal_usd_cents, so.discount_usd_cents,
+              o.id AS order_id, o.order_number, o.user_id AS order_user_id, o.customer_phone,
+              sel.owner_user_id
+       FROM sub_orders so
+       INNER JOIN orders o ON o.id = so.order_id
+       INNER JOIN sellers sel ON sel.id = so.seller_id
+       WHERE so.id = ? LIMIT 1`,
+      [subOrderId]
+    );
+    if (!row) throw new Error('Sub-order not found.');
+
+    if (opts.userId) {
+      if (row.order_user_id !== opts.userId) {
+        throw new Error('You do not own this order.');
+      }
+      return row;
+    }
+
+    const ordNum = (opts.orderNumber || '').trim().toUpperCase();
+    const normSubmitted = normalizePhone(opts.phone || '');
+    if (!ordNum || normSubmitted.length < 6) {
+      throw new Error('Order number and customer phone are required for guest requests.');
+    }
+    if (row.order_number.toUpperCase() !== ordNum || normalizePhone(row.customer_phone) !== normSubmitted) {
+      throw new Error('Order verification failed.');
+    }
+    return row;
+  }
+
+  async createReturnRequest(input: {
+    subOrderId: string;
+    userId?: string | null;
+    orderNumber?: string;
+    phone?: string;
+    reason: string;
+  }): Promise<ReturnRequest> {
+    return this.db.transaction(async (tx) => {
+      const sub = await this.verifySubOrderOwnership(tx, input.subOrderId, {
+        userId: input.userId,
+        orderNumber: input.orderNumber,
+        phone: input.phone,
+      });
+
+      const dup = await tx.queryOne<{ id: string }>(
+        "SELECT id FROM returns WHERE sub_order_id = ? AND status IN ('requested', 'approved', 'refunded') LIMIT 1",
+        [input.subOrderId]
+      );
+      if (dup) throw new Error('A return request already exists for this shipment.');
+
+      const id = `ret-${crypto.randomUUID()}`;
+      const now = toSqlTimestamp();
+      const refundUsdCents = Math.max(0, Number(sub.subtotal_usd_cents) - Number(sub.discount_usd_cents || 0));
+      const actorId = input.userId || `guest:${normalizePhone(input.phone || '')}`;
+
+      await tx.execute(
+        'INSERT INTO returns (id, sub_order_id, user_id, reason, status, refund_usd_cents, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [id, input.subOrderId, actorId, input.reason.trim(), 'requested', refundUsdCents, now]
+      );
+
+      await this.createNotification(
+        tx,
+        sub.owner_user_id,
+        { en: `Return requested on ${sub.order_number}`, ar: `طلب إرجاع على الطلب ${sub.order_number}` },
+        { en: input.reason.trim().slice(0, 140), ar: input.reason.trim().slice(0, 140) }
+      );
+
+      await writeAuditLog(tx, {
+        actorUserId: input.userId || null,
+        action: 'customer.return_requested',
+        entityType: 'return',
+        entityId: id,
+        after: { subOrderId: input.subOrderId, refundUsdCents },
+      });
+
+      return {
+        id,
+        subOrderId: input.subOrderId,
+        userId: actorId,
+        reason: input.reason.trim(),
+        status: 'requested',
+        refundUsdCents,
+        createdAt: now,
+        orderNumber: sub.order_number,
+        sellerId: sub.seller_id,
+      };
+    });
+  }
+
+  async createDispute(input: {
+    subOrderId: string;
+    userId?: string | null;
+    orderNumber?: string;
+    phone?: string;
+    reason: string;
+  }): Promise<OrderDispute> {
+    return this.db.transaction(async (tx) => {
+      const sub = await this.verifySubOrderOwnership(tx, input.subOrderId, {
+        userId: input.userId,
+        orderNumber: input.orderNumber,
+        phone: input.phone,
+      });
+
+      const id = `dsp-${crypto.randomUUID()}`;
+      const now = toSqlTimestamp();
+      const actorId = input.userId || `guest:${normalizePhone(input.phone || '')}`;
+
+      await tx.execute(
+        'INSERT INTO disputes (id, sub_order_id, opened_by_user_id, reason, status, resolution_note, created_at) VALUES (?, ?, ?, ?, ?, NULL, ?)',
+        [id, input.subOrderId, actorId, input.reason.trim(), 'open', now]
+      );
+
+      await this.createNotification(
+        tx,
+        sub.owner_user_id,
+        { en: `Dispute opened on ${sub.order_number}`, ar: `تم فتح نزاع على الطلب ${sub.order_number}` },
+        { en: input.reason.trim().slice(0, 140), ar: input.reason.trim().slice(0, 140) }
+      );
+
+      await writeAuditLog(tx, {
+        actorUserId: input.userId || null,
+        action: 'customer.dispute_opened',
+        entityType: 'dispute',
+        entityId: id,
+        after: { subOrderId: input.subOrderId },
+      });
+
+      return {
+        id,
+        subOrderId: input.subOrderId,
+        openedByUserId: actorId,
+        reason: input.reason.trim(),
+        status: 'open',
+        resolutionNote: null,
+        createdAt: now,
+        orderNumber: sub.order_number,
+        sellerId: sub.seller_id,
+      };
+    });
+  }
+
+  async getUserCases(userId: string): Promise<{ returns: ReturnRequest[]; disputes: OrderDispute[] }> {
+    const returnRows = await this.db.query<Record<string, unknown>>(
+      `SELECT r.*, o.order_number, so.seller_id
+       FROM returns r
+       INNER JOIN sub_orders so ON so.id = r.sub_order_id
+       INNER JOIN orders o ON o.id = so.order_id
+       WHERE r.user_id = ? OR o.user_id = ?
+       ORDER BY r.created_at DESC`,
+      [userId, userId]
+    );
+    const disputeRows = await this.db.query<Record<string, unknown>>(
+      `SELECT d.*, o.order_number, so.seller_id
+       FROM disputes d
+       INNER JOIN sub_orders so ON so.id = d.sub_order_id
+       INNER JOIN orders o ON o.id = so.order_id
+       WHERE d.opened_by_user_id = ? OR o.user_id = ?
+       ORDER BY d.created_at DESC`,
+      [userId, userId]
+    );
+
+    return {
+      returns: returnRows.map((r) => ({
+        id: String(r.id),
+        subOrderId: String(r.sub_order_id),
+        userId: String(r.user_id),
+        reason: String(r.reason),
+        status: String(r.status) as ReturnRequest['status'],
+        refundUsdCents: Number(r.refund_usd_cents || 0),
+        createdAt: String(r.created_at),
+        orderNumber: r.order_number ? String(r.order_number) : undefined,
+        sellerId: r.seller_id ? String(r.seller_id) : undefined,
+      })),
+      disputes: disputeRows.map((d) => ({
+        id: String(d.id),
+        subOrderId: String(d.sub_order_id),
+        openedByUserId: String(d.opened_by_user_id),
+        reason: String(d.reason),
+        status: String(d.status) as OrderDispute['status'],
+        resolutionNote: d.resolution_note ? String(d.resolution_note) : null,
+        createdAt: String(d.created_at),
+        orderNumber: d.order_number ? String(d.order_number) : undefined,
+        sellerId: d.seller_id ? String(d.seller_id) : undefined,
+      })),
+    };
+  }
+
+  async getCasesForSubOrders(subOrderIds: string[]): Promise<{ returns: ReturnRequest[]; disputes: OrderDispute[] }> {
+    if (subOrderIds.length === 0) return { returns: [], disputes: [] };
+    const placeholders = subOrderIds.map(() => '?').join(', ');
+    const [returnRows, disputeRows] = await Promise.all([
+      this.db.query<Record<string, unknown>>(
+        `SELECT r.*, o.order_number, so.seller_id
+         FROM returns r
+         INNER JOIN sub_orders so ON so.id = r.sub_order_id
+         INNER JOIN orders o ON o.id = so.order_id
+         WHERE r.sub_order_id IN (${placeholders})
+         ORDER BY r.created_at DESC`,
+        subOrderIds
+      ),
+      this.db.query<Record<string, unknown>>(
+        `SELECT d.*, o.order_number, so.seller_id
+         FROM disputes d
+         INNER JOIN sub_orders so ON so.id = d.sub_order_id
+         INNER JOIN orders o ON o.id = so.order_id
+         WHERE d.sub_order_id IN (${placeholders})
+         ORDER BY d.created_at DESC`,
+        subOrderIds
+      ),
+    ]);
+
+    return {
+      returns: returnRows.map((r) => ({
+        id: String(r.id),
+        subOrderId: String(r.sub_order_id),
+        userId: String(r.user_id),
+        reason: String(r.reason),
+        status: String(r.status) as ReturnRequest['status'],
+        refundUsdCents: Number(r.refund_usd_cents || 0),
+        createdAt: String(r.created_at),
+        orderNumber: r.order_number ? String(r.order_number) : undefined,
+        sellerId: r.seller_id ? String(r.seller_id) : undefined,
+      })),
+      disputes: disputeRows.map((d) => ({
+        id: String(d.id),
+        subOrderId: String(d.sub_order_id),
+        openedByUserId: String(d.opened_by_user_id),
+        reason: String(d.reason),
+        status: String(d.status) as OrderDispute['status'],
+        resolutionNote: d.resolution_note ? String(d.resolution_note) : null,
+        createdAt: String(d.created_at),
+        orderNumber: d.order_number ? String(d.order_number) : undefined,
+        sellerId: d.seller_id ? String(d.seller_id) : undefined,
+      })),
+    };
+  }
+
+  async createSupportTicket(input: {
+    userId: string | null;
+    email: string;
+    subject: string;
+    message: string;
+  }): Promise<SupportTicket> {
+    const id = `tkt-${crypto.randomUUID()}`;
+    const now = toSqlTimestamp();
+    await this.db.execute(
+      'INSERT INTO support_tickets (id, user_id, email, subject, message, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [id, input.userId, input.email.trim().toLowerCase(), input.subject.trim(), input.message.trim(), 'open', now]
+    );
+    return {
+      id,
+      userId: input.userId,
+      email: input.email.trim().toLowerCase(),
+      subject: input.subject.trim(),
+      message: input.message.trim(),
+      status: 'open',
+      createdAt: now,
+    };
+  }
+
+  async getUserSupportTickets(userId: string): Promise<SupportTicket[]> {
+    const rows = await this.db.query<Record<string, unknown>>(
+      'SELECT * FROM support_tickets WHERE user_id = ? ORDER BY created_at DESC LIMIT 50',
+      [userId]
+    );
+    return rows.map((t) => ({
+      id: String(t.id),
+      userId: t.user_id ? String(t.user_id) : null,
+      email: String(t.email),
+      subject: String(t.subject),
+      message: String(t.message),
+      status: String(t.status) as SupportTicket['status'],
+      createdAt: String(t.created_at),
+    }));
+  }
+
+  // --- Seller Extended Catalog, Plan Upgrade, Staff & Returns ---
+  async updateSellerProduct(
+    sellerId: string,
+    productId: string,
+    actorUserId: string,
+    patch: {
+      titleEn?: string;
+      titleAr?: string;
+      subtitleEn?: string;
+      subtitleAr?: string;
+      descriptionEn?: string;
+      descriptionAr?: string;
+      basePriceUsdCents?: number;
+      compareAtUsdCents?: number | null;
+      department?: 'fashion' | 'electronics' | 'home-gadgets';
+      categoryId?: string;
+      brandId?: string | null;
+      specs?: ProductSpec[];
+      model3dUrl?: string | null;
+      published?: boolean;
+      mediaIds?: string[];
+      variants?: Array<{
+        id?: string;
+        sku: string;
+        size?: string;
+        color: string;
+        colorHex: string;
+        stock: number;
+        priceDeltaUsdCents?: number;
+      }>;
+    },
+    ipAddress?: string
+  ): Promise<Product> {
+    if (patch.basePriceUsdCents !== undefined && (!Number.isInteger(patch.basePriceUsdCents) || patch.basePriceUsdCents <= 0)) {
+      throw new Error('Price must be a positive integer in USD cents.');
+    }
+
+    return this.db.transaction(async (tx) => {
+      const existing = await tx.queryOne<Record<string, unknown>>(
+        'SELECT * FROM products WHERE id = ? AND seller_id = ? AND deleted_at IS NULL',
+        [productId, sellerId]
+      );
+      if (!existing) throw new Error('Product not found.');
+
+      const currTitle = parseJson<LocalizedText>(existing.title_json, { en: '', ar: '' });
+      const currSub = parseJson<LocalizedText>(existing.subtitle_json, { en: '', ar: '' });
+      const currDesc = parseJson<LocalizedText>(existing.description_json, { en: '', ar: '' });
+      const now = toSqlTimestamp();
+
+      const nextTitle = {
+        en: patch.titleEn !== undefined ? patch.titleEn.trim() : currTitle.en,
+        ar: patch.titleAr !== undefined ? patch.titleAr.trim() : currTitle.ar,
+      };
+      const nextSub = {
+        en: patch.subtitleEn !== undefined ? patch.subtitleEn.trim() : currSub.en,
+        ar: patch.subtitleAr !== undefined ? patch.subtitleAr.trim() : currSub.ar,
+      };
+      const nextDesc = {
+        en: patch.descriptionEn !== undefined ? patch.descriptionEn.trim() : currDesc.en,
+        ar: patch.descriptionAr !== undefined ? patch.descriptionAr.trim() : currDesc.ar,
+      };
+
+      await tx.execute(
+        `UPDATE products
+         SET category_id = COALESCE(?, category_id),
+             brand_id = ?,
+             department = COALESCE(?, department),
+             title_json = ?,
+             subtitle_json = ?,
+             description_json = ?,
+             specs_json = COALESCE(?, specs_json),
+             base_price_usd_cents = COALESCE(?, base_price_usd_cents),
+             compare_at_usd_cents = ?,
+             model_3d_url = ?,
+             published = COALESCE(?, published),
+             updated_at = ?
+         WHERE id = ?`,
+        [
+          patch.categoryId || null,
+          patch.brandId !== undefined ? patch.brandId : existing.brand_id,
+          patch.department || null,
+          JSON.stringify(nextTitle),
+          JSON.stringify(nextSub),
+          JSON.stringify(nextDesc),
+          patch.specs ? JSON.stringify(patch.specs) : null,
+          patch.basePriceUsdCents ?? null,
+          patch.compareAtUsdCents !== undefined ? patch.compareAtUsdCents : existing.compare_at_usd_cents,
+          patch.model3dUrl !== undefined ? (patch.model3dUrl?.trim() || null) : existing.model_3d_url,
+          patch.published !== undefined ? (patch.published ? 1 : 0) : null,
+          now,
+          productId,
+        ]
+      );
+
+      if (patch.variants && patch.variants.length > 0) {
+        const existingVars = await tx.query<{ id: string; stock: number }>(
+          'SELECT id, stock FROM product_variants WHERE product_id = ?',
+          [productId]
+        );
+        const existingMap = new Map(existingVars.map((v) => [v.id, Number(v.stock)]));
+        const keepIds = new Set<string>();
+
+        for (const v of patch.variants) {
+          const vStock = Math.max(0, Math.trunc(v.stock));
+          const deltaCents = Math.trunc(v.priceDeltaUsdCents || 0);
+          if (v.id && existingMap.has(v.id)) {
+            keepIds.add(v.id);
+            const prevStock = existingMap.get(v.id)!;
+            await tx.execute(
+              `UPDATE product_variants SET sku = ?, size = ?, color = ?, color_hex = ?, stock = ?, price_delta_usd_cents = ?
+               WHERE id = ? AND product_id = ?`,
+              [v.sku.trim(), v.size?.trim() || null, v.color.trim(), v.colorHex || '#1C1D21', vStock, deltaCents, v.id, productId]
+            );
+            if (vStock !== prevStock) {
+              await tx.execute(
+                'INSERT INTO stock_movements (id, variant_id, delta, reason, reference_id, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+                [`stk-${crypto.randomUUID()}`, v.id, vStock - prevStock, 'manual_adjustment', productId, now]
+              );
+            }
+          } else {
+            const newVarId = `var-${crypto.randomUUID()}`;
+            keepIds.add(newVarId);
+            await tx.execute(
+              `INSERT INTO product_variants (id, product_id, sku, size, color, color_hex, stock, price_delta_usd_cents)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+              [newVarId, productId, v.sku.trim(), v.size?.trim() || null, v.color.trim(), v.colorHex || '#1C1D21', vStock, deltaCents]
+            );
+            await tx.execute(
+              'INSERT INTO stock_movements (id, variant_id, delta, reason, reference_id, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+              [`stk-${crypto.randomUUID()}`, newVarId, vStock, 'initial_stock', productId, now]
+            );
+          }
+        }
+
+        for (const oldVar of existingVars) {
+          if (!keepIds.has(oldVar.id)) {
+            const hasOrders = await tx.queryOne<{ id: string }>(
+              'SELECT id FROM order_items WHERE variant_id = ? LIMIT 1',
+              [oldVar.id]
+            );
+            if (!hasOrders) {
+              await tx.execute('DELETE FROM product_variants WHERE id = ?', [oldVar.id]);
+            }
+          }
+        }
+      }
+
+      if (patch.mediaIds && patch.mediaIds.length > 0) {
+        for (const mId of patch.mediaIds) {
+          await tx.execute('UPDATE media SET entity_id = ? WHERE id = ? AND owner_user_id = ?', [
+            productId,
+            mId,
+            actorUserId,
+          ]);
+        }
+      }
+
+      await writeAuditLog(tx, {
+        actorUserId,
+        action: 'seller.update_product',
+        entityType: 'product',
+        entityId: productId,
+        after: { titleEn: nextTitle.en, basePriceUsdCents: patch.basePriceUsdCents },
+        ipAddress,
+      });
+
+      const updated = await tx.queryOne<Record<string, unknown>>('SELECT * FROM products WHERE id = ?', [productId]);
+      const [mapped] = await this.mapProductRows([updated!], tx);
+      return mapped;
+    });
+  }
+
+  async deleteSellerProduct(sellerId: string, productId: string, actorUserId: string, ipAddress?: string): Promise<void> {
+    const existing = await this.db.queryOne<{ id: string }>(
+      'SELECT id FROM products WHERE id = ? AND seller_id = ? AND deleted_at IS NULL',
+      [productId, sellerId]
+    );
+    if (!existing) throw new Error('Product not found.');
+    const now = toSqlTimestamp();
+    await this.db.execute('UPDATE products SET deleted_at = ?, published = 0, updated_at = ? WHERE id = ?', [
+      now,
+      now,
+      productId,
+    ]);
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'seller.delete_product',
+      entityType: 'product',
+      entityId: productId,
+      ipAddress,
+    });
+  }
+
+  async switchSellerPlan(sellerId: string, actorUserId: string, planTier: SubscriptionTier, ipAddress?: string) {
+    return this.db.transaction(async (tx) => {
+      const plan = await tx.queryOne<{ tier: string; monthly_fee_usd_cents: number }>(
+        'SELECT tier, monthly_fee_usd_cents FROM subscription_plans WHERE tier = ?',
+        [planTier]
+      );
+      if (!plan) throw new Error('Subscription plan not found.');
+      const nextDue = toSqlTimestamp(new Date(Date.now() + 30 * 86_400_000));
+      const now = toSqlTimestamp();
+
+      const existingSub = await tx.queryOne<{ id: string; plan_tier: string }>(
+        'SELECT id, plan_tier FROM subscriptions WHERE seller_id = ? ORDER BY created_at DESC LIMIT 1',
+        [sellerId]
+      );
+      if (existingSub) {
+        await tx.execute("UPDATE subscriptions SET plan_tier = ?, status = 'active', next_due_at = ? WHERE id = ?", [
+          planTier,
+          nextDue,
+          existingSub.id,
+        ]);
+      } else {
+        await tx.execute(
+          "INSERT INTO subscriptions (id, seller_id, plan_tier, status, next_due_at, created_at) VALUES (?, ?, ?, 'active', ?, ?)",
+          [`subp-${crypto.randomUUID()}`, sellerId, planTier, nextDue, now]
+        );
+      }
+
+      if (Number(plan.monthly_fee_usd_cents) > 0 && existingSub?.plan_tier !== planTier) {
+        await tx.execute(
+          `INSERT INTO ledger_entries (id, seller_id, entry_type, direction, amount_usd_cents, availability, note, created_at)
+           VALUES (?, ?, 'SUBSCRIPTION_FEE', 'debit', ?, 'available', ?, ?)`,
+          [`led-${crypto.randomUUID()}`, sellerId, Number(plan.monthly_fee_usd_cents), `Plan upgrade to ${planTier.toUpperCase()}`, now]
+        );
+      }
+
+      await writeAuditLog(tx, {
+        actorUserId,
+        action: 'seller.switch_plan',
+        entityType: 'subscription',
+        entityId: sellerId,
+        before: { planTier: existingSub?.plan_tier || 'free' },
+        after: { planTier },
+        ipAddress,
+      });
+
+      return { planTier, nextDue };
+    });
+  }
+
+  async listSellerStaff(sellerId: string): Promise<SellerStaffMember[]> {
+    const mapRow = await this.db.queryOne<{ value_json: string }>(
+      `SELECT value_json FROM settings WHERE ${this.keyCol()} = 'seller_staff_map'`
+    );
+    const map = parseJson<Record<string, string>>(mapRow?.value_json, {});
+    const staffIds = Object.entries(map)
+      .filter(([, sid]) => sid === sellerId)
+      .map(([uid]) => uid);
+    if (staffIds.length === 0) return [];
+
+    const placeholders = staffIds.map(() => '?').join(', ');
+    const rows = await this.db.query<{
+      id: string;
+      name: string;
+      email: string;
+      phone: string;
+      totp_enabled: number | boolean;
+      created_at: string;
+    }>(
+      `SELECT id, name, email, phone, totp_enabled, created_at FROM users WHERE id IN (${placeholders}) AND deleted_at IS NULL`,
+      staffIds
+    );
+
+    const out: SellerStaffMember[] = [];
+    for (const r of rows) {
+      const perms = await this.db.query<{ permission_key: string }>(
+        'SELECT permission_key FROM user_permissions WHERE user_id = ?',
+        [r.id]
+      );
+      out.push({
+        userId: r.id,
+        sellerId,
+        name: r.name,
+        email: r.email,
+        phone: r.phone,
+        permissions: perms.map((p) => p.permission_key),
+        totpEnabled: Boolean(r.totp_enabled),
+        createdAt: String(r.created_at),
+      });
+    }
+    return out;
+  }
+
+  async createSellerStaff(
+    sellerId: string,
+    actorUserId: string,
+    input: { name: string; email: string; phone: string; password: string; permissions: string[] },
+    ipAddress?: string
+  ): Promise<SellerStaffMember> {
+    const pwErr = validatePasswordStrength(input.password);
+    if (pwErr) throw new Error(pwErr);
+
+    const allowedSellerPerms = new Set(['seller.catalog', 'seller.orders', 'seller.finance']);
+    const cleanPerms = input.permissions.filter((p) => allowedSellerPerms.has(p));
+    if (cleanPerms.length === 0) throw new Error('Select at least one valid seller permission.');
+
+    const emailNorm = input.email.trim().toLowerCase();
+    return this.db.transaction(async (tx) => {
+      const dup = await tx.queryOne<{ id: string }>('SELECT id FROM users WHERE LOWER(email) = ?', [emailNorm]);
+      if (dup) throw new Error('Email is already registered.');
+
+      const userId = `usr-${crypto.randomUUID()}`;
+      const now = toSqlTimestamp();
+      await tx.execute(
+        `INSERT INTO users (id, name, email, phone, password_hash, role_key, email_verified_at, preferred_locale, preferred_currency, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'seller_staff', ?, 'en', 'USD', ?, ?)`,
+        [userId, input.name.trim(), emailNorm, input.phone.trim(), hashPassword(input.password), now, now, now]
+      );
+
+      for (const perm of cleanPerms) {
+        await tx.execute('INSERT INTO user_permissions (id, user_id, permission_key) VALUES (?, ?, ?)', [
+          `up-${crypto.randomUUID()}`,
+          userId,
+          perm,
+        ]);
+      }
+
+      const kCol = this.keyCol();
+      const mapRow = await tx.queryOne<{ value_json: string }>(
+        `SELECT value_json FROM settings WHERE ${kCol} = 'seller_staff_map'`
+      );
+      const currMap = parseJson<Record<string, string>>(mapRow?.value_json, {});
+      currMap[userId] = sellerId;
+      await tx.execute(
+        this.db.driver === 'mysql'
+          ? `INSERT INTO settings (${kCol}, value_json, updated_at) VALUES ('seller_staff_map', ?, ?) ON DUPLICATE KEY UPDATE value_json = VALUES(value_json), updated_at = VALUES(updated_at)`
+          : `INSERT INTO settings (${kCol}, value_json, updated_at) VALUES ('seller_staff_map', ?, ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
+        [JSON.stringify(currMap), now]
+      );
+
+      await writeAuditLog(tx, {
+        actorUserId,
+        action: 'seller.create_staff',
+        entityType: 'user',
+        entityId: userId,
+        after: { sellerId, email: emailNorm, permissions: cleanPerms },
+        ipAddress,
+      });
+
+      return {
+        userId,
+        sellerId,
+        name: input.name.trim(),
+        email: emailNorm,
+        phone: input.phone.trim(),
+        permissions: cleanPerms,
+        totpEnabled: false,
+        createdAt: now,
+      };
+    });
+  }
+
+  async removeSellerStaff(sellerId: string, staffUserId: string, actorUserId: string, ipAddress?: string): Promise<void> {
+    return this.db.transaction(async (tx) => {
+      const kCol = this.keyCol();
+      const mapRow = await tx.queryOne<{ value_json: string }>(
+        `SELECT value_json FROM settings WHERE ${kCol} = 'seller_staff_map'`
+      );
+      const currMap = parseJson<Record<string, string>>(mapRow?.value_json, {});
+      if (currMap[staffUserId] !== sellerId) {
+        throw new Error('Staff member not found for this store.');
+      }
+      delete currMap[staffUserId];
+      const now = toSqlTimestamp();
+      await tx.execute(`UPDATE settings SET value_json = ?, updated_at = ? WHERE ${kCol} = 'seller_staff_map'`, [
+        JSON.stringify(currMap),
+        now,
+      ]);
+      await tx.execute('UPDATE users SET deleted_at = ?, is_blocked = 1, updated_at = ? WHERE id = ?', [
+        now,
+        now,
+        staffUserId,
+      ]);
+      await tx.execute('DELETE FROM sessions WHERE user_id = ?', [staffUserId]);
+
+      await writeAuditLog(tx, {
+        actorUserId,
+        action: 'seller.remove_staff',
+        entityType: 'user',
+        entityId: staffUserId,
+        after: { sellerId },
+        ipAddress,
+      });
+    });
+  }
+
+  async sellerUpdateReturn(
+    sellerId: string,
+    actorUserId: string,
+    returnId: string,
+    patch: { status: 'approved' | 'rejected' },
+    ipAddress?: string
+  ) {
+    return this.db.transaction(async (tx) => {
+      const row = await tx.queryOne<{ id: string; user_id: string; status: string; order_number: string }>(
+        `SELECT r.id, r.user_id, r.status, o.order_number
+         FROM returns r
+         INNER JOIN sub_orders so ON so.id = r.sub_order_id
+         INNER JOIN orders o ON o.id = so.order_id
+         WHERE r.id = ? AND so.seller_id = ? LIMIT 1`,
+        [returnId, sellerId]
+      );
+      if (!row) throw new Error('Return request not found.');
+      if (row.status === 'refunded') throw new Error('Refund already finalized.');
+
+      await tx.execute('UPDATE returns SET status = ? WHERE id = ?', [patch.status, returnId]);
+      if (!row.user_id.startsWith('guest:')) {
+        await this.createNotification(
+          tx,
+          row.user_id,
+          { en: `Return ${patch.status} (${row.order_number})`, ar: `تحديث الإرجاع: ${patch.status}` },
+          { en: `Merchant marked return request as ${patch.status}.`, ar: `قام التاجر بتحديث حالة الإرجاع إلى ${patch.status}.` }
+        );
+      }
+      await writeAuditLog(tx, {
+        actorUserId,
+        action: 'seller.update_return',
+        entityType: 'return',
+        entityId: returnId,
+        before: { status: row.status },
+        after: { status: patch.status },
+        ipAddress,
+      });
+      return tx.queryOne('SELECT * FROM returns WHERE id = ?', [returnId]);
+    });
+  }
+
+  // --- Admin Moderation, Categories/Brands/Attributes, KYC, Cases, Support, Zones, Plans, Templates, Menus, Users ---
+  async adminModerateProduct(
+    productId: string,
+    actorUserId: string,
+    patch: { moderationStatus?: 'pending' | 'approved' | 'rejected'; published?: boolean; featured?: boolean },
+    ipAddress?: string
+  ): Promise<Product> {
+    return this.db.transaction(async (tx) => {
+      const existing = await tx.queryOne<Record<string, unknown>>(
+        'SELECT * FROM products WHERE id = ? AND deleted_at IS NULL',
+        [productId]
+      );
+      if (!existing) throw new Error('Product not found.');
+
+      const nextMod = patch.moderationStatus || String(existing.moderation_status || 'pending');
+      const nextPub = patch.published !== undefined ? (patch.published ? 1 : 0) : Number(existing.published);
+      const nextFeat = patch.featured !== undefined ? (patch.featured ? 1 : 0) : Number(existing.featured);
+
+      await tx.execute(
+        'UPDATE products SET moderation_status = ?, published = ?, featured = ?, updated_at = ? WHERE id = ?',
+        [nextMod, nextPub, nextFeat, toSqlTimestamp(), productId]
+      );
+
+      await writeAuditLog(tx, {
+        actorUserId,
+        action: 'admin.moderate_product',
+        entityType: 'product',
+        entityId: productId,
+        before: { moderationStatus: existing.moderation_status, published: Boolean(existing.published), featured: Boolean(existing.featured) },
+        after: { moderationStatus: nextMod, published: Boolean(nextPub), featured: Boolean(nextFeat) },
+        ipAddress,
+      });
+
+      const updated = await tx.queryOne<Record<string, unknown>>('SELECT * FROM products WHERE id = ?', [productId]);
+      const [mapped] = await this.mapProductRows([updated!], tx);
+      return mapped;
+    });
+  }
+
+  async adminCreateCategory(
+    actorUserId: string,
+    input: {
+      slug: string;
+      parentId?: string | null;
+      department: 'fashion' | 'electronics' | 'home-gadgets';
+      name: LocalizedText;
+      commissionBps?: number | null;
+      sortOrder?: number;
+    },
+    ipAddress?: string
+  ): Promise<Category> {
+    const cleanSlug = input.slug.trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-|-$/g, '');
+    if (cleanSlug.length < 2) throw new Error('Category slug must be at least 2 characters.');
+    const dup = await this.db.queryOne<{ id: string }>('SELECT id FROM categories WHERE slug = ?', [cleanSlug]);
+    if (dup) throw new Error(`Category slug "${cleanSlug}" already exists.`);
+
+    const id = `cat-${cleanSlug}-${crypto.randomBytes(2).toString('hex')}`;
+    await this.db.execute(
+      `INSERT INTO categories (id, parent_id, slug, department, name_json, commission_bps, sort_order, active)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
+      [
+        id,
+        input.parentId || null,
+        cleanSlug,
+        input.department,
+        JSON.stringify(input.name),
+        input.commissionBps ?? null,
+        Math.trunc(input.sortOrder ?? 10),
+      ]
+    );
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.create_category',
+      entityType: 'category',
+      entityId: id,
+      after: { slug: cleanSlug, commissionBps: input.commissionBps },
+      ipAddress,
+    });
+    return {
+      id,
+      parentId: input.parentId || null,
+      slug: cleanSlug,
+      department: input.department,
+      name: input.name,
+      commissionBps: input.commissionBps ?? null,
+    };
+  }
+
+  async adminUpdateCategory(
+    id: string,
+    actorUserId: string,
+    patch: { name?: LocalizedText; commissionBps?: number | null; sortOrder?: number; active?: boolean },
+    ipAddress?: string
+  ): Promise<Category> {
+    const existing = await this.db.queryOne<Record<string, unknown>>('SELECT * FROM categories WHERE id = ?', [id]);
+    if (!existing) throw new Error('Category not found.');
+    const nextName = patch.name || parseJson<LocalizedText>(existing.name_json, { en: id, ar: id });
+    await this.db.execute(
+      'UPDATE categories SET name_json = ?, commission_bps = ?, sort_order = ?, active = ? WHERE id = ?',
+      [
+        JSON.stringify(nextName),
+        patch.commissionBps !== undefined ? patch.commissionBps : existing.commission_bps,
+        patch.sortOrder !== undefined ? Math.trunc(patch.sortOrder) : Number(existing.sort_order),
+        patch.active !== undefined ? (patch.active ? 1 : 0) : Number(existing.active),
+        id,
+      ]
+    );
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.update_category',
+      entityType: 'category',
+      entityId: id,
+      after: patch,
+      ipAddress,
+    });
+    return {
+      id,
+      parentId: existing.parent_id ? String(existing.parent_id) : null,
+      slug: String(existing.slug),
+      department: String(existing.department) as Category['department'],
+      name: nextName,
+      commissionBps: patch.commissionBps !== undefined ? patch.commissionBps : (existing.commission_bps as number | null),
+    };
+  }
+
+  async adminDeleteCategory(id: string, actorUserId: string, ipAddress?: string): Promise<void> {
+    if (['cat-fashion', 'cat-electronics', 'cat-home'].includes(id)) {
+      throw new Error('Core department categories cannot be deleted.');
+    }
+    await this.db.execute('UPDATE categories SET active = 0 WHERE id = ?', [id]);
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.delete_category',
+      entityType: 'category',
+      entityId: id,
+      ipAddress,
+    });
+  }
+
+  async adminCreateBrand(actorUserId: string, input: { slug: string; name: LocalizedText }, ipAddress?: string): Promise<BrandItem> {
+    const cleanSlug = input.slug.trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-|-$/g, '');
+    if (cleanSlug.length < 2) throw new Error('Brand slug must be at least 2 characters.');
+    const dup = await this.db.queryOne<{ id: string }>('SELECT id FROM brands WHERE slug = ? AND active = 1', [cleanSlug]);
+    if (dup) throw new Error(`Brand "${cleanSlug}" already exists.`);
+    const id = `brd-${crypto.randomUUID()}`;
+    await this.db.execute('INSERT INTO brands (id, slug, name_json, active) VALUES (?, ?, ?, 1)', [
+      id,
+      cleanSlug,
+      JSON.stringify(input.name),
+    ]);
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.create_brand',
+      entityType: 'brand',
+      entityId: id,
+      after: { slug: cleanSlug },
+      ipAddress,
+    });
+    return { id, slug: cleanSlug, name: input.name, active: true };
+  }
+
+  async adminDeleteBrand(id: string, actorUserId: string, ipAddress?: string): Promise<void> {
+    await this.db.execute('UPDATE brands SET active = 0 WHERE id = ?', [id]);
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.delete_brand',
+      entityType: 'brand',
+      entityId: id,
+      ipAddress,
+    });
+  }
+
+  async adminCreateAttribute(
+    actorUserId: string,
+    input: { code: string; name: LocalizedText; values: string[] },
+    ipAddress?: string
+  ): Promise<AttributeItem> {
+    const cleanCode = input.code.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '_');
+    const cleanVals = input.values.map((v) => v.trim()).filter(Boolean);
+    const id = `atr-${crypto.randomUUID()}`;
+    await this.db.execute('INSERT INTO attributes (id, code, name_json, values_json) VALUES (?, ?, ?, ?)', [
+      id,
+      cleanCode,
+      JSON.stringify(input.name),
+      JSON.stringify(cleanVals),
+    ]);
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.create_attribute',
+      entityType: 'attribute',
+      entityId: id,
+      after: { code: cleanCode, values: cleanVals },
+      ipAddress,
+    });
+    return { id, code: cleanCode, name: input.name, values: cleanVals };
+  }
+
+  async adminDeleteAttribute(id: string, actorUserId: string, ipAddress?: string): Promise<void> {
+    await this.db.execute('DELETE FROM attributes WHERE id = ?', [id]);
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.delete_attribute',
+      entityType: 'attribute',
+      entityId: id,
+      ipAddress,
+    });
+  }
+
+  async adminReviewSellerDocument(
+    docId: string,
+    actorUserId: string,
+    patch: { reviewStatus: 'approved' | 'rejected'; reviewerNote?: string },
+    ipAddress?: string
+  ) {
+    return this.db.transaction(async (tx) => {
+      const doc = await tx.queryOne<{ id: string; seller_id: string; doc_type: string }>(
+        'SELECT id, seller_id, doc_type FROM seller_documents WHERE id = ?',
+        [docId]
+      );
+      if (!doc) throw new Error('Document not found.');
+
+      await tx.execute('UPDATE seller_documents SET review_status = ?, reviewer_note = ? WHERE id = ?', [
+        patch.reviewStatus,
+        patch.reviewerNote?.trim() || null,
+        docId,
+      ]);
+
+      const seller = await tx.queryOne<{ owner_user_id: string }>('SELECT owner_user_id FROM sellers WHERE id = ?', [
+        doc.seller_id,
+      ]);
+      if (seller) {
+        await this.createNotification(
+          tx,
+          seller.owner_user_id,
+          { en: `KYC document ${patch.reviewStatus}`, ar: `مستند التحقق: ${patch.reviewStatus}` },
+          {
+            en: `${doc.doc_type} marked ${patch.reviewStatus}${patch.reviewerNote ? `: ${patch.reviewerNote}` : '.'}`,
+            ar: `تمت مراجعة ${doc.doc_type} كـ ${patch.reviewStatus}${patch.reviewerNote ? `: ${patch.reviewerNote}` : '.'}`,
+          }
+        );
+      }
+
+      await writeAuditLog(tx, {
+        actorUserId,
+        action: 'admin.review_seller_document',
+        entityType: 'seller_document',
+        entityId: docId,
+        after: patch,
+        ipAddress,
+      });
+
+      return tx.queryOne('SELECT * FROM seller_documents WHERE id = ?', [docId]);
+    });
+  }
+
+  async adminResolveReturn(
+    returnId: string,
+    actorUserId: string,
+    patch: { status: 'approved' | 'rejected' | 'refunded'; refundUsdCents?: number },
+    ipAddress?: string
+  ) {
+    return this.db.transaction(async (tx) => {
+      const ret = await tx.queryOne<{
+        id: string;
+        sub_order_id: string;
+        user_id: string;
+        status: string;
+        refund_usd_cents: number;
+      }>('SELECT * FROM returns WHERE id = ?', [returnId]);
+      if (!ret) throw new Error('Return request not found.');
+      if (ret.status === 'refunded') throw new Error('Return is already refunded.');
+
+      const sub = await tx.queryOne<{
+        id: string;
+        order_id: string;
+        seller_id: string;
+        subtotal_usd_cents: number;
+        discount_usd_cents: number;
+        order_number: string;
+        owner_user_id: string;
+      }>(
+        `SELECT so.id, so.order_id, so.seller_id, so.subtotal_usd_cents, so.discount_usd_cents, o.order_number, sel.owner_user_id
+         FROM sub_orders so
+         INNER JOIN orders o ON o.id = so.order_id
+         INNER JOIN sellers sel ON sel.id = so.seller_id
+         WHERE so.id = ? LIMIT 1`,
+        [ret.sub_order_id]
+      );
+      if (!sub) throw new Error('Linked sub-order not found.');
+
+      const maxRefund = Math.max(0, Number(sub.subtotal_usd_cents) - Number(sub.discount_usd_cents || 0));
+      const refundAmount =
+        patch.refundUsdCents !== undefined
+          ? Math.min(maxRefund, Math.max(0, Math.trunc(patch.refundUsdCents)))
+          : Number(ret.refund_usd_cents || maxRefund);
+
+      await tx.execute('UPDATE returns SET status = ?, refund_usd_cents = ? WHERE id = ?', [
+        patch.status,
+        refundAmount,
+        returnId,
+      ]);
+
+      const now = toSqlTimestamp();
+      if (patch.status === 'refunded' && refundAmount > 0) {
+        const grossLed = await tx.queryOne<{ availability: string }>(
+          "SELECT availability FROM ledger_entries WHERE sub_order_id = ? AND entry_type = 'ORDER_GROSS' LIMIT 1",
+          [sub.id]
+        );
+        const availability = grossLed?.availability === 'available' ? 'available' : 'pending';
+
+        await tx.execute(
+          `INSERT INTO ledger_entries (id, seller_id, sub_order_id, order_number, entry_type, direction, amount_usd_cents, availability, note, created_at)
+           VALUES (?, ?, ?, ?, 'ORDER_REFUND', 'debit', ?, ?, ?, ?)`,
+          [
+            `led-${crypto.randomUUID()}`,
+            sub.seller_id,
+            sub.id,
+            sub.order_number,
+            refundAmount,
+            availability,
+            `Customer refund for return ${returnId} (${sub.order_number})`,
+            now,
+          ]
+        );
+        await tx.execute("UPDATE orders SET payment_status = 'refunded' WHERE id = ?", [sub.order_id]);
+      }
+
+      if (!ret.user_id.startsWith('guest:')) {
+        await this.createNotification(
+          tx,
+          ret.user_id,
+          { en: `Return ${patch.status} (${sub.order_number})`, ar: `حالة الإرجاع: ${patch.status}` },
+          {
+            en:
+              patch.status === 'refunded'
+                ? `Refund of $${(refundAmount / 100).toFixed(2)} processed for ${sub.order_number}.`
+                : `Your return request on ${sub.order_number} is now ${patch.status}.`,
+            ar:
+              patch.status === 'refunded'
+                ? `تمت معالجة استرداد ${(refundAmount / 100).toFixed(2)} دولار للطلب ${sub.order_number}.`
+                : `تم تحديث طلب الإرجاع للطلب ${sub.order_number} إلى ${patch.status}.`,
+          }
+        );
+      }
+
+      await this.createNotification(
+        tx,
+        sub.owner_user_id,
+        { en: `Admin return update: ${patch.status}`, ar: `تحديث إداري للإرجاع: ${patch.status}` },
+        {
+          en: `Return on ${sub.order_number} resolved as ${patch.status} ($${(refundAmount / 100).toFixed(2)}).`,
+          ar: `تم حسم طلب الإرجاع للطلب ${sub.order_number} (${patch.status}).`,
+        }
+      );
+
+      await writeAuditLog(tx, {
+        actorUserId,
+        action: 'admin.resolve_return',
+        entityType: 'return',
+        entityId: returnId,
+        before: { status: ret.status, refundUsdCents: ret.refund_usd_cents },
+        after: { status: patch.status, refundUsdCents: refundAmount },
+        ipAddress,
+      });
+
+      return tx.queryOne('SELECT * FROM returns WHERE id = ?', [returnId]);
+    });
+  }
+
+  async adminResolveDispute(
+    disputeId: string,
+    actorUserId: string,
+    patch: { status: 'open' | 'investigating' | 'resolved_buyer' | 'resolved_seller' | 'closed'; resolutionNote?: string },
+    ipAddress?: string
+  ) {
+    return this.db.transaction(async (tx) => {
+      const disp = await tx.queryOne<{ id: string; sub_order_id: string; opened_by_user_id: string; status: string }>(
+        'SELECT * FROM disputes WHERE id = ?',
+        [disputeId]
+      );
+      if (!disp) throw new Error('Dispute not found.');
+
+      await tx.execute('UPDATE disputes SET status = ?, resolution_note = ? WHERE id = ?', [
+        patch.status,
+        patch.resolutionNote?.trim() || null,
+        disputeId,
+      ]);
+
+      const sub = await tx.queryOne<{ order_number: string; owner_user_id: string }>(
+        `SELECT o.order_number, sel.owner_user_id
+         FROM sub_orders so
+         INNER JOIN orders o ON o.id = so.order_id
+         INNER JOIN sellers sel ON sel.id = so.seller_id
+         WHERE so.id = ? LIMIT 1`,
+        [disp.sub_order_id]
+      );
+
+      if (!disp.opened_by_user_id.startsWith('guest:')) {
+        await this.createNotification(
+          tx,
+          disp.opened_by_user_id,
+          { en: `Dispute updated (${sub?.order_number || disputeId})`, ar: `تحديث النزاع (${sub?.order_number || disputeId})` },
+          { en: `Status: ${patch.status}. ${patch.resolutionNote || ''}`.trim(), ar: `الحالة: ${patch.status}. ${patch.resolutionNote || ''}`.trim() }
+        );
+      }
+      if (sub?.owner_user_id) {
+        await this.createNotification(
+          tx,
+          sub.owner_user_id,
+          { en: `Dispute updated (${sub.order_number})`, ar: `تحديث النزاع (${sub.order_number})` },
+          { en: `Status: ${patch.status}. ${patch.resolutionNote || ''}`.trim(), ar: `الحالة: ${patch.status}. ${patch.resolutionNote || ''}`.trim() }
+        );
+      }
+
+      await writeAuditLog(tx, {
+        actorUserId,
+        action: 'admin.resolve_dispute',
+        entityType: 'dispute',
+        entityId: disputeId,
+        before: { status: disp.status },
+        after: patch,
+        ipAddress,
+      });
+
+      return tx.queryOne('SELECT * FROM disputes WHERE id = ?', [disputeId]);
+    });
+  }
+
+  async adminModerateReview(
+    reviewId: string,
+    actorUserId: string,
+    status: 'approved' | 'hidden' | 'rejected',
+    ipAddress?: string
+  ) {
+    return this.db.transaction(async (tx) => {
+      const rev = await tx.queryOne<{ id: string; product_id: string; seller_id: string; moderation_status: string }>(
+        'SELECT id, product_id, seller_id, moderation_status FROM reviews WHERE id = ?',
+        [reviewId]
+      );
+      if (!rev) throw new Error('Review not found.');
+
+      await tx.execute('UPDATE reviews SET moderation_status = ? WHERE id = ?', [status, reviewId]);
+
+      const pStats = await tx.queryOne<{ avg_r: number | null; cnt: number }>(
+        "SELECT AVG(rating) AS avg_r, COUNT(*) AS cnt FROM reviews WHERE product_id = ? AND moderation_status = 'approved'",
+        [rev.product_id]
+      );
+      await tx.execute('UPDATE products SET rating_avg_x10 = ?, review_count = ? WHERE id = ?', [
+        Math.round(Number(pStats?.avg_r || 0) * 10),
+        Number(pStats?.cnt || 0),
+        rev.product_id,
+      ]);
+
+      const sStats = await tx.queryOne<{ avg_r: number | null; cnt: number }>(
+        "SELECT AVG(rating) AS avg_r, COUNT(*) AS cnt FROM reviews WHERE seller_id = ? AND moderation_status = 'approved'",
+        [rev.seller_id]
+      );
+      await tx.execute('UPDATE stores SET rating_avg_x10 = ?, review_count = ? WHERE seller_id = ?', [
+        Math.round(Number(sStats?.avg_r || 0) * 10),
+        Number(sStats?.cnt || 0),
+        rev.seller_id,
+      ]);
+
+      await writeAuditLog(tx, {
+        actorUserId,
+        action: 'admin.moderate_review',
+        entityType: 'review',
+        entityId: reviewId,
+        before: { moderationStatus: rev.moderation_status },
+        after: { moderationStatus: status },
+        ipAddress,
+      });
+
+      return { id: reviewId, moderationStatus: status };
+    });
+  }
+
+  async adminUpdateSupportTicket(
+    ticketId: string,
+    actorUserId: string,
+    status: SupportTicket['status'],
+    ipAddress?: string
+  ) {
+    const t = await this.db.queryOne<{ id: string; user_id: string | null; subject: string; status: string }>(
+      'SELECT id, user_id, subject, status FROM support_tickets WHERE id = ?',
+      [ticketId]
+    );
+    if (!t) throw new Error('Support ticket not found.');
+
+    await this.db.execute('UPDATE support_tickets SET status = ? WHERE id = ?', [status, ticketId]);
+    if (t.user_id) {
+      await this.createNotification(
+        this.db,
+        t.user_id,
+        { en: `Support ticket ${status}`, ar: `تحديث تذكرة الدعم: ${status}` },
+        { en: `${t.subject} is now marked ${status}.`, ar: `تم تحديث حالة التذكرة "${t.subject}" إلى ${status}.` }
+      );
+    }
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.update_support_ticket',
+      entityType: 'support_ticket',
+      entityId: ticketId,
+      before: { status: t.status },
+      after: { status },
+      ipAddress,
+    });
+    return this.db.queryOne('SELECT * FROM support_tickets WHERE id = ?', [ticketId]);
+  }
+
+  async adminUpdateDeliveryZone(
+    governorateCode: string,
+    actorUserId: string,
+    patch: { platformFeeUsdCents?: number; etaDays?: string },
+    ipAddress?: string
+  ): Promise<DeliveryZone> {
+    const existing = await this.db.queryOne<{
+      governorate_code: string;
+      name_json: string;
+      platform_fee_usd_cents: number;
+      eta_days: string;
+    }>('SELECT * FROM delivery_zones WHERE governorate_code = ?', [governorateCode]);
+    if (!existing) throw new Error('Delivery zone not found.');
+
+    const nextFee =
+      patch.platformFeeUsdCents !== undefined ? Math.max(0, Math.trunc(patch.platformFeeUsdCents)) : Number(existing.platform_fee_usd_cents);
+    const nextEta = patch.etaDays !== undefined ? patch.etaDays.trim() : existing.eta_days;
+
+    await this.db.execute('UPDATE delivery_zones SET platform_fee_usd_cents = ?, eta_days = ? WHERE governorate_code = ?', [
+      nextFee,
+      nextEta,
+      governorateCode,
+    ]);
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.update_delivery_zone',
+      entityType: 'delivery_zone',
+      entityId: governorateCode,
+      after: { platformFeeUsdCents: nextFee, etaDays: nextEta },
+      ipAddress,
+    });
+    return {
+      governorateCode,
+      name: parseJson<LocalizedText>(existing.name_json, { en: governorateCode, ar: governorateCode }),
+      platformFeeUsdCents: nextFee,
+      etaDays: nextEta,
+    };
+  }
+
+  async adminUpdateSubscriptionPlan(
+    tier: SubscriptionTier,
+    actorUserId: string,
+    patch: { monthlyFeeUsdCents?: number; productLimit?: number | null; commissionDiscountBps?: number },
+    ipAddress?: string
+  ): Promise<SubscriptionPlan> {
+    const existing = await this.db.queryOne<{
+      tier: SubscriptionTier;
+      name_json: string;
+      monthly_fee_usd_cents: number;
+      product_limit: number | null;
+      commission_discount_bps: number;
+      features_json: string;
+    }>('SELECT * FROM subscription_plans WHERE tier = ?', [tier]);
+    if (!existing) throw new Error('Subscription plan not found.');
+
+    const nextFee =
+      patch.monthlyFeeUsdCents !== undefined ? Math.max(0, Math.trunc(patch.monthlyFeeUsdCents)) : Number(existing.monthly_fee_usd_cents);
+    const nextLimit = patch.productLimit !== undefined ? patch.productLimit : existing.product_limit;
+    const nextDiscount =
+      patch.commissionDiscountBps !== undefined ? Math.max(0, Math.min(2000, Math.trunc(patch.commissionDiscountBps))) : Number(existing.commission_discount_bps);
+
+    await this.db.execute(
+      'UPDATE subscription_plans SET monthly_fee_usd_cents = ?, product_limit = ?, commission_discount_bps = ? WHERE tier = ?',
+      [nextFee, nextLimit, nextDiscount, tier]
+    );
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.update_subscription_plan',
+      entityType: 'subscription_plan',
+      entityId: tier,
+      after: { monthlyFeeUsdCents: nextFee, productLimit: nextLimit, commissionDiscountBps: nextDiscount },
+      ipAddress,
+    });
+    return {
+      tier,
+      name: parseJson<LocalizedText>(existing.name_json, { en: tier, ar: tier }),
+      monthlyFeeUsdCents: nextFee,
+      productLimit: nextLimit === null ? null : Number(nextLimit),
+      commissionDiscountBps: nextDiscount,
+      features: parseJson<LocalizedText[]>(existing.features_json, []),
+    };
+  }
+
+  async adminUpdateEmailTemplate(
+    key: string,
+    actorUserId: string,
+    patch: { subject: LocalizedText; body: LocalizedText },
+    ipAddress?: string
+  ): Promise<EmailTemplateItem> {
+    const kCol = this.keyCol();
+    const existing = await this.db.queryOne<{ key?: string }>(`SELECT ${kCol} FROM email_templates WHERE ${kCol} = ?`, [key]);
+    if (!existing) throw new Error('Email template not found.');
+    const now = toSqlTimestamp();
+    await this.db.execute(
+      `UPDATE email_templates SET subject_json = ?, body_json = ?, updated_at = ? WHERE ${kCol} = ?`,
+      [JSON.stringify(patch.subject), JSON.stringify(patch.body), now, key]
+    );
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.update_email_template',
+      entityType: 'email_template',
+      entityId: key,
+      after: patch,
+      ipAddress,
+    });
+    return { key, subject: patch.subject, body: patch.body, updatedAt: now };
+  }
+
+  async adminCreatePage(
+    actorUserId: string,
+    input: { slug: string; titleEn: string; titleAr: string; bodyEn: string; bodyAr: string; published?: boolean },
+    ipAddress?: string
+  ): Promise<PageContent> {
+    const cleanSlug = input.slug.trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-|-$/g, '');
+    if (cleanSlug.length < 2) throw new Error('Page slug must be at least 2 characters.');
+    const dup = await this.db.queryOne<{ id: string }>('SELECT id FROM pages WHERE slug = ?', [cleanSlug]);
+    if (dup) throw new Error(`Page slug "${cleanSlug}" already exists.`);
+
+    const id = `page-${crypto.randomUUID()}`;
+    const now = toSqlTimestamp();
+    const title = { en: input.titleEn.trim(), ar: input.titleAr.trim() };
+    const body = { en: input.bodyEn, ar: input.bodyAr };
+    const pub = input.published === false ? 0 : 1;
+
+    await this.db.execute(
+      'INSERT INTO pages (id, slug, title_json, body_json, published, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+      [id, cleanSlug, JSON.stringify(title), JSON.stringify(body), pub, now]
+    );
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.create_page',
+      entityType: 'page',
+      entityId: id,
+      after: { slug: cleanSlug, published: Boolean(pub) },
+      ipAddress,
+    });
+    return { id, slug: cleanSlug, title, body, published: Boolean(pub), updatedAt: now };
+  }
+
+  async adminDeletePage(slug: string, actorUserId: string, ipAddress?: string): Promise<void> {
+    if (['terms', 'privacy', 'returns', 'seller-agreement'].includes(slug)) {
+      throw new Error('Core legal pages cannot be deleted.');
+    }
+    const existing = await this.db.queryOne<{ id: string }>('SELECT id FROM pages WHERE slug = ?', [slug]);
+    if (!existing) throw new Error('Page not found.');
+    await this.db.execute('DELETE FROM pages WHERE slug = ?', [slug]);
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.delete_page',
+      entityType: 'page',
+      entityId: existing.id,
+      after: { slug },
+      ipAddress,
+    });
+  }
+
+  async adminListMenus(): Promise<MenuConfig[]> {
+    const rows = await this.db.query<{ id: string; location: string; items_json: string }>(
+      'SELECT id, location, items_json FROM menus ORDER BY location ASC'
+    );
+    return rows.map((r) => ({
+      id: r.id,
+      location: r.location,
+      items: parseJson<Array<{ label: LocalizedText; url: string }>>(r.items_json, []),
+    }));
+  }
+
+  async adminSaveMenu(
+    location: string,
+    actorUserId: string,
+    items: Array<{ label: LocalizedText; url: string }>,
+    ipAddress?: string
+  ): Promise<MenuConfig> {
+    const existing = await this.db.queryOne<{ id: string }>('SELECT id FROM menus WHERE location = ? LIMIT 1', [location]);
+    const id = existing?.id || `menu-${location}`;
+    if (existing) {
+      await this.db.execute('UPDATE menus SET items_json = ? WHERE id = ?', [JSON.stringify(items), id]);
+    } else {
+      await this.db.execute('INSERT INTO menus (id, location, items_json) VALUES (?, ?, ?)', [
+        id,
+        location,
+        JSON.stringify(items),
+      ]);
+    }
+    await writeAuditLog(this.db, {
+      actorUserId,
+      action: 'admin.save_menu',
+      entityType: 'menu',
+      entityId: id,
+      after: { location, itemCount: items.length },
+      ipAddress,
+    });
+    return { id, location, items };
+  }
+
+  async adminUpdateUserAccess(
+    userId: string,
+    actorUserId: string,
+    patch: { isBlocked?: boolean; permissions?: string[] },
+    ipAddress?: string
+  ) {
+    return this.db.transaction(async (tx) => {
+      const target = await tx.queryOne<{ id: string; role_key: string; is_blocked: number | boolean }>(
+        'SELECT id, role_key, is_blocked FROM users WHERE id = ? AND deleted_at IS NULL',
+        [userId]
+      );
+      if (!target) throw new Error('User not found.');
+      if (target.role_key === 'admin_super' && patch.isBlocked) {
+        throw new Error('Cannot block a Super Admin account.');
+      }
+
+      if (patch.isBlocked !== undefined) {
+        await tx.execute('UPDATE users SET is_blocked = ?, updated_at = ? WHERE id = ?', [
+          patch.isBlocked ? 1 : 0,
+          toSqlTimestamp(),
+          userId,
+        ]);
+        if (patch.isBlocked) {
+          await tx.execute('DELETE FROM sessions WHERE user_id = ?', [userId]);
+        }
+      }
+
+      if (patch.permissions !== undefined) {
+        await tx.execute('DELETE FROM user_permissions WHERE user_id = ?', [userId]);
+        for (const perm of patch.permissions) {
+          await tx.execute('INSERT INTO user_permissions (id, user_id, permission_key) VALUES (?, ?, ?)', [
+            `up-${crypto.randomUUID()}`,
+            userId,
+            perm,
+          ]);
+        }
+      }
+
+      await writeAuditLog(tx, {
+        actorUserId,
+        action: 'admin.update_user_access',
+        entityType: 'user',
+        entityId: userId,
+        after: patch,
+        ipAddress,
+      });
+
+      return { ok: true, userId };
+    });
   }
 
   async releaseHoldsNow(actorUserId: string, ipAddress?: string) {

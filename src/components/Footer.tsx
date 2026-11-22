@@ -136,6 +136,12 @@ export function Footer({
             <button type="button" onClick={() => safeNavigate('/legal?tab=seller')} className="editorial-link cursor-pointer">
               {t.legalSellerAgreement}
             </button>
+            <button type="button" onClick={() => safeNavigate('/support')} className="editorial-link cursor-pointer">
+              {t.navSupport}
+            </button>
+            <button type="button" onClick={() => safeNavigate('/account')} className="editorial-link cursor-pointer">
+              {t.navAccount}
+            </button>
           </div>
         </div>
       </div>

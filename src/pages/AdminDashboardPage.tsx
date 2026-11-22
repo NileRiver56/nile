@@ -2,14 +2,21 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { Download, KeyRound, Lock, RefreshCw, ShieldCheck } from 'lucide-react';
 import type {
   AuditLogEntry,
+  AutomationFlow,
+  Campaign,
   Category,
   Coupon,
+  CustomerSegment,
   DeliveryZone,
+  EmailCampaign,
   FeaturedPlacement,
+  FlashSale,
   HomeSection,
   HomeSectionVersion,
   LedgerEntry,
+  MarketingAnalyticsSummary,
   MarketingPopup,
+  NewsletterSubscriber,
   Offer,
   OfferBanner,
   Order,
@@ -18,6 +25,7 @@ import type {
   PayoutRequest,
   PlatformSettings,
   Seller,
+  SellerPromoRules,
   SubscriptionPlan,
 } from '../shared/types.ts';
 import { formatBpsAsPercent } from '../shared/money.ts';
@@ -52,6 +60,14 @@ interface AdminOverviewPayload {
   popups: MarketingPopup[];
   featuredPlacements: FeaturedPlacement[];
   offers: Offer[];
+  flashSales: FlashSale[];
+  campaigns: Campaign[];
+  segments: CustomerSegment[];
+  emailCampaigns: EmailCampaign[];
+  automationFlows: AutomationFlow[];
+  newsletterSubscribers: NewsletterSubscriber[];
+  sellerPromoRules?: SellerPromoRules;
+  marketingAnalytics?: MarketingAnalyticsSummary;
   auditLog: AuditLogEntry[];
   staffUsers: Array<{
     id: string;
@@ -411,7 +427,13 @@ export function AdminDashboardPage() {
               overview.banners.length +
               (overview.popups?.length || 0) +
               (overview.featuredPlacements?.length || 0) +
-              overview.offers.length
+              overview.offers.length +
+              overview.coupons.length +
+              (overview.flashSales?.length || 0) +
+              (overview.campaigns?.length || 0) +
+              (overview.segments?.length || 0) +
+              (overview.emailCampaigns?.length || 0) +
+              (overview.automationFlows?.length || 0)
             })`,
           },
           { id: 'pages' as const, label: `Legal & Pages (${overview.pages.length})` },
@@ -634,6 +656,16 @@ export function AdminDashboardPage() {
           popups={overview.popups || []}
           featuredPlacements={overview.featuredPlacements || []}
           offers={overview.offers}
+          coupons={overview.coupons || []}
+          flashSales={overview.flashSales || []}
+          campaigns={overview.campaigns || []}
+          segments={overview.segments || []}
+          emailCampaigns={overview.emailCampaigns || []}
+          automationFlows={overview.automationFlows || []}
+          newsletterSubscribers={overview.newsletterSubscribers || []}
+          emailLog={overview.emailLog || []}
+          sellerPromoRules={overview.sellerPromoRules}
+          marketingAnalytics={overview.marketingAnalytics}
           categories={overview.categories}
           sellers={overview.sellers}
           onReload={loadOverview}

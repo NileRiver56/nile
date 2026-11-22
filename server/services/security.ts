@@ -248,10 +248,34 @@ export async function getSessionUser(db: DbClient, rawToken: string): Promise<Au
 
   if (!row || row.is_blocked || row.deleted_at) return null;
 
-  const sellerRow = await db.queryOne<{ id: string }>(
+  let sellerRow = await db.queryOne<{ id: string }>(
     'SELECT id FROM sellers WHERE owner_user_id = ? AND deleted_at IS NULL LIMIT 1',
     [row.user_id]
   );
+
+  if (!sellerRow && row.role_key === 'seller_staff') {
+    const keyCol = db.driver === 'mysql' ? '`key`' : 'key';
+    const mapRow = await db.queryOne<{ value_json: string }>(
+      `SELECT value_json FROM settings WHERE ${keyCol} = 'seller_staff_map'`
+    );
+    if (mapRow?.value_json) {
+      try {
+        const parsed =
+          typeof mapRow.value_json === 'string'
+            ? (JSON.parse(mapRow.value_json) as Record<string, string>)
+            : (mapRow.value_json as Record<string, string>);
+        const mappedSellerId = parsed[row.user_id];
+        if (mappedSellerId) {
+          sellerRow = await db.queryOne<{ id: string }>(
+            'SELECT id FROM sellers WHERE id = ? AND deleted_at IS NULL LIMIT 1',
+            [mappedSellerId]
+          );
+        }
+      } catch {
+        // Ignore malformed map
+      }
+    }
+  }
 
   const rolePerms = await db.query<{ permission_key: string }>(
     'SELECT permission_key FROM role_permissions WHERE role_key = ?',
@@ -262,10 +286,13 @@ export async function getSessionUser(db: DbClient, rawToken: string): Promise<Au
     [row.user_id]
   );
 
-  const permSet = new Set<string>([
-    ...rolePerms.map((p) => p.permission_key),
-    ...userPerms.map((p) => p.permission_key),
-  ]);
+  const permSet =
+    row.role_key === 'seller_staff' && userPerms.length > 0
+      ? new Set<string>(userPerms.map((p) => p.permission_key))
+      : new Set<string>([
+          ...rolePerms.map((p) => p.permission_key),
+          ...userPerms.map((p) => p.permission_key),
+        ]);
 
   return {
     id: row.user_id,

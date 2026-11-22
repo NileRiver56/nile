@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ChevronDown, Globe, LogOut, Moon, ShoppingBag, Sun, X } from 'lucide-react';
+import { ChevronDown, Globe, LogOut, Moon, ShoppingBag, Sun, User, X } from 'lucide-react';
 import type { Locale, SiteChromeSettings, ThemeMode } from '../shared/types.ts';
 import { getCopy } from '../shared/i18n.ts';
 import { useMarketplace } from '../context/MarketplaceContext.tsx';
@@ -32,6 +32,7 @@ export function Header({
     setIsCartOpen,
     authUser,
     logout,
+    unreadNotificationsCount,
   } = ctx;
 
   const [bannerDismissed, setBannerDismissed] = useState(false);
@@ -123,17 +124,50 @@ export function Header({
           </div>
 
           <div className="flex items-center gap-3 shrink-0 font-mono-tabular">
-            {authUser && !previewMode && (
+            {!previewMode && (
               <>
                 <button
                   type="button"
-                  onClick={() => void logout()}
-                  title={authUser.email}
-                  className="inline-flex items-center gap-1 text-[var(--cedar)] hover:text-[var(--ember)] whitespace-nowrap shrink-0 cursor-pointer"
+                  onClick={() => safeNavigate('/support')}
+                  className="hidden sm:inline-flex text-[var(--muted)] hover:text-[var(--bone)] whitespace-nowrap shrink-0 cursor-pointer"
                 >
-                  <span className="hidden sm:inline">{authUser.name}</span>
-                  <LogOut className="w-3 h-3" aria-hidden="true" />
+                  {t.navSupport}
                 </button>
+                <span className="hidden sm:inline text-[var(--line)]" aria-hidden="true">|</span>
+                {authUser ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => safeNavigate('/account')}
+                      title={authUser.email}
+                      className="inline-flex items-center gap-1 text-[var(--cedar)] hover:text-[var(--ember)] whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      <User className="w-3 h-3" aria-hidden="true" />
+                      <span className="hidden sm:inline">{authUser.name}</span>
+                      {unreadNotificationsCount > 0 && (
+                        <span className="text-[var(--ember)] font-bold">· {unreadNotificationsCount}</span>
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void logout()}
+                      aria-label="Sign out"
+                      title="Sign out"
+                      className="inline-flex items-center text-[var(--muted)] hover:text-[var(--ember)] whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      <LogOut className="w-3 h-3" aria-hidden="true" />
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => safeNavigate('/account')}
+                    className="inline-flex items-center gap-1 text-[var(--bone)] hover:text-[var(--ember)] whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <User className="w-3 h-3" aria-hidden="true" />
+                    <span>{t.navAccount}</span>
+                  </button>
+                )}
                 <span className="text-[var(--line)]" aria-hidden="true">|</span>
               </>
             )}

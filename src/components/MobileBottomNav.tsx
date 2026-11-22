@@ -1,5 +1,5 @@
 import React from 'react';
-import { Grid, Home, Package, ShoppingBag, Store } from 'lucide-react';
+import { Grid, Home, Package, ShoppingBag, User } from 'lucide-react';
 import { useMarketplace } from '../context/MarketplaceContext.tsx';
 
 export function MobileBottomNav() {
@@ -36,11 +36,11 @@ export function MobileBottomNav() {
       onClick: () => setIsCartOpen(true),
     },
     {
-      id: 'seller',
-      label: locale === 'ar' ? 'البائع' : 'Seller',
-      icon: Store,
-      active: route.startsWith('/seller') || route.startsWith('/admin'),
-      onClick: () => navigate('/seller'),
+      id: 'account',
+      label: locale === 'ar' ? 'حسابي' : 'Account',
+      icon: User,
+      active: route.startsWith('/account') || route.startsWith('/seller') || route.startsWith('/admin'),
+      onClick: () => navigate('/account'),
     },
   ];
 

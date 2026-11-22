@@ -11,7 +11,7 @@ import { getDb, type DbClient } from './server/db/client.ts';
 import { ensureEssentialSeed } from './server/db/essentialSeed.ts';
 import { MarketplaceRepo } from './server/db/marketplaceRepo.ts';
 import { isCardGatewayConfigured } from './server/paymentAdapters.ts';
-import { emailAdapter } from './server/services/email.ts';
+import { emailAdapter, renderEmailBlocks } from './server/services/email.ts';
 import { processPendingJobs } from './server/services/jobs.ts';
 import {
   clearSessionCookies,
@@ -32,7 +32,7 @@ import {
 import { smsAdapter } from './server/services/sms.ts';
 import { getStorageAdapter, getStorageStatus, saveUploadedMedia } from './server/services/storage.ts';
 import { ALL_HOME_SECTION_TYPES } from './src/shared/homeSections.ts';
-import type { SiteChromeSettings } from './src/shared/types.ts';
+import type { OfferType, SiteChromeSettings } from './src/shared/types.ts';
 
 declare global {
   namespace Express {
@@ -189,6 +189,40 @@ async function createApp() {
     next();
   }
 
+  function requireSellerPerm(...permissions: string[]) {
+    return (req: Request, res: Response, next: NextFunction) => {
+      if (!req.authUser || (!isSellerRole(req.authUser.roleKey) && !isAdminRole(req.authUser.roleKey))) {
+        return res.status(403).json({ error: 'Seller authorization required.' });
+      }
+      if (isAdminRole(req.authUser.roleKey) || req.authUser.roleKey === 'seller_owner') {
+        return next();
+      }
+      if (permissions.length > 0 && !permissions.some((p) => hasPermission(req.authUser, p))) {
+        return res.status(403).json({ error: `Missing seller permission: ${permissions.join(' or ')}` });
+      }
+      next();
+    };
+  }
+
+  function requireSellerOwnerOrAdmin(req: Request, res: Response, next: NextFunction) {
+    if (!req.authUser || (req.authUser.roleKey !== 'seller_owner' && !isAdminRole(req.authUser.roleKey))) {
+      return res.status(403).json({ error: 'Store owner or admin authorization required.' });
+    }
+    next();
+  }
+
+  function resolveTargetSellerId(req: Request): string {
+    if (req.authUser && isAdminRole(req.authUser.roleKey)) {
+      const fromReq = typeof req.query.sellerId === 'string' && req.query.sellerId
+        ? req.query.sellerId
+        : typeof req.body?.sellerId === 'string' && req.body.sellerId
+        ? req.body.sellerId
+        : req.authUser.sellerId || '';
+      return fromReq;
+    }
+    return req.authUser?.sellerId || '';
+  }
+
   function requireAdminPerm(...permissions: string[]) {
     return (req: Request, res: Response, next: NextFunction) => {
       if (!req.authUser || !isAdminRole(req.authUser.roleKey)) {
@@ -308,6 +342,32 @@ async function createApp() {
     }
   });
 
+  app.get('/api/newsletter/unsubscribe', rateLimit(30, 60_000), async (req, res) => {
+    const token = String(req.query.token || '').trim();
+    const ok = await repo.unsubscribeNewsletterByToken(token);
+    res
+      .status(ok ? 200 : 404)
+      .type('text/html; charset=utf-8')
+      .send(`<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><title>NileLink Newsletter Preferences</title></head>
+  <body style="margin:0;padding:48px 16px;background:#17181B;color:#F3EFE8;font-family:Arial,Helvetica,sans-serif;">
+    <div style="max-width:520px;margin:0 auto;border:1px solid #30343B;background:#222428;padding:28px;">
+      <div style="font-family:monospace;font-size:11px;letter-spacing:2px;text-transform:uppercase;color:#EA580C;">NILELINK LEBANON</div>
+      <h1 style="margin:10px 0 8px;font-size:22px;">${ok ? 'You have been unsubscribed' : 'Invalid unsubscribe link'}</h1>
+      <p style="margin:0 0 20px;font-size:14px;line-height:1.6;color:#C7C4BC;">
+        ${
+          ok
+            ? 'Your email address has been removed from NileLink marketing broadcasts and automated promotional emails.'
+            : 'This unsubscribe token could not be found or has expired.'
+        }
+      </p>
+      <a href="/" style="display:inline-block;padding:10px 18px;border:1px solid #EA580C;color:#EA580C;text-decoration:none;font-size:12px;font-weight:bold;text-transform:uppercase;">Return to NileLink</a>
+    </div>
+  </body>
+</html>`);
+  });
+
   app.post('/api/banners/:id/track', rateLimit(120, 60_000), async (req, res) => {
     try {
       const body = validateBody(z.object({ event: z.enum(['impression', 'click']) }), req.body);
@@ -399,6 +459,26 @@ async function createApp() {
       const page = await repo.getPageBySlug(req.params.slug);
       if (!page) return res.status(404).json({ error: 'Page not found.' });
       res.json({ page });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/api/campaigns/:slug', async (req, res, next) => {
+    try {
+      const campaign = await repo.getPublicCampaignBySlug(req.params.slug);
+      if (!campaign) return res.status(404).json({ error: 'Campaign not found.' });
+      const [allOffers, activeFlashSales] = await Promise.all([
+        repo.getActiveOffers(),
+        repo.getActiveFlashSales(),
+      ]);
+      const linkedOffers = allOffers.filter(
+        (o) => o.campaignId === campaign.id || campaign.featuredOfferIds.includes(o.id)
+      );
+      const linkedFlashSale = campaign.featuredFlashSaleId
+        ? activeFlashSales.find((f) => f.id === campaign.featuredFlashSaleId) || null
+        : null;
+      res.json({ campaign, offers: linkedOffers, flashSale: linkedFlashSale });
     } catch (err) {
       next(err);
     }
@@ -507,6 +587,32 @@ async function createApp() {
     }
   });
 
+  app.post('/api/auth/forgot-password', rateLimit(10, 60_000), async (req, res) => {
+    try {
+      const { email } = validateBody(z.object({ email: z.string().email().max(180) }), req.body);
+      const result = await repo.requestPasswordReset(email, getClientIp(req));
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/auth/reset-password', rateLimit(10, 60_000), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          token: z.string().min(16).max(160),
+          newPassword: z.string().min(8).max(128),
+        }),
+        req.body
+      );
+      const result = await repo.confirmPasswordReset(body.token, body.newPassword, getClientIp(req));
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
   // --- First-Run Super Admin Setup (One-Time Token from Server Logs) ---
   app.get('/api/admin/auth-status', async (_req, res, next) => {
     try {
@@ -609,6 +715,142 @@ async function createApp() {
     }
   });
 
+  app.patch('/api/account/profile', requireAuth, async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          name: z.string().min(2).max(140).optional(),
+          phone: z.string().min(7).max(40).optional(),
+          preferredLocale: z.enum(['en', 'ar']).optional(),
+          preferredCurrency: z.enum(['USD', 'LBP']).optional(),
+        }),
+        req.body
+      );
+      const profile = await repo.updateAccountProfile(req.authUser!.id, body);
+      res.json({ profile });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.get('/api/account/addresses', requireAuth, async (req, res, next) => {
+    try {
+      res.json({ addresses: await repo.getUserAddresses(req.authUser!.id) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/account/addresses', requireAuth, async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          label: z.string().min(2).max(80),
+          governorate: z.string().min(2).max(60),
+          district: z.string().min(2).max(60),
+          town: z.string().min(1).max(100),
+          phone: z.string().min(7).max(40),
+          notes: z.string().max(400).optional(),
+          isDefault: z.boolean().optional(),
+        }),
+        req.body
+      );
+      const address = await repo.createUserAddress(req.authUser!.id, body);
+      res.status(201).json({ address });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.patch('/api/account/addresses/:id', requireAuth, async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          label: z.string().min(2).max(80).optional(),
+          governorate: z.string().min(2).max(60).optional(),
+          district: z.string().min(2).max(60).optional(),
+          town: z.string().min(1).max(100).optional(),
+          phone: z.string().min(7).max(40).optional(),
+          notes: z.string().max(400).optional(),
+          isDefault: z.boolean().optional(),
+        }),
+        req.body
+      );
+      const address = await repo.updateUserAddress(req.authUser!.id, req.params.id, body);
+      res.json({ address });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.delete('/api/account/addresses/:id', requireAuth, async (req, res) => {
+    try {
+      await repo.deleteUserAddress(req.authUser!.id, req.params.id);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.get('/api/account/notifications', requireAuth, async (req, res, next) => {
+    try {
+      res.json({ notifications: await repo.getUserNotifications(req.authUser!.id) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/account/notifications/:id/read', requireAuth, async (req, res) => {
+    try {
+      const result = await repo.markNotificationRead(req.authUser!.id, req.params.id);
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.get('/api/account/cases', requireAuth, async (req, res, next) => {
+    try {
+      res.json(await repo.getUserCases(req.authUser!.id));
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/api/support-tickets', requireAuth, async (req, res, next) => {
+    try {
+      res.json({ tickets: await repo.getUserSupportTickets(req.authUser!.id) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/support-tickets', rateLimit(15, 60_000), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          email: z.string().email().max(180).optional(),
+          subject: z.string().min(3).max(200),
+          message: z.string().min(10).max(4000),
+        }),
+        req.body
+      );
+      const email = body.email || req.authUser?.email;
+      if (!email) {
+        return res.status(400).json({ error: 'Email address is required.' });
+      }
+      const ticket = await repo.createSupportTicket({
+        userId: req.authUser?.id || null,
+        email,
+        subject: body.subject,
+        message: body.message,
+      });
+      res.status(201).json({ ticket });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
   // --- Cart Coupon Validation, Checkout & Order Tracking ---
   app.post('/api/coupons/validate', async (req, res) => {
     try {
@@ -617,10 +859,14 @@ async function createApp() {
           code: z.string().min(2),
           subtotalUsdCents: z.number().int().nonnegative(),
           sellerIds: z.array(z.string()),
+          customerPhone: z.string().max(40).optional(),
         }),
         req.body
       );
-      const coupon = await repo.validateCoupon(body.code, body.subtotalUsdCents, body.sellerIds);
+      const coupon = await repo.validateCoupon(body.code, body.subtotalUsdCents, body.sellerIds, {
+        userId: req.authUser?.id || null,
+        customerPhone: body.customerPhone || null,
+      });
       res.json({ coupon });
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
@@ -669,9 +915,59 @@ async function createApp() {
         orderNumber: String(req.query.orderNumber || ''),
         phone: String(req.query.phone || ''),
       });
-      res.json({ orders });
+      const subOrderIds = orders.flatMap((o) => o.subOrders.map((s) => s.id));
+      const cases = await repo.getCasesForSubOrders(subOrderIds);
+      res.json({ orders, ...cases });
     } catch (err) {
       next(err);
+    }
+  });
+
+  app.post('/api/returns', rateLimit(15, 60_000), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          subOrderId: z.string().min(1),
+          reason: z.string().min(5).max(1200),
+          orderNumber: z.string().max(60).optional(),
+          phone: z.string().max(40).optional(),
+        }),
+        req.body
+      );
+      const ret = await repo.createReturnRequest({
+        subOrderId: body.subOrderId,
+        userId: req.authUser?.id || null,
+        orderNumber: body.orderNumber,
+        phone: body.phone,
+        reason: body.reason,
+      });
+      res.status(201).json({ returnRequest: ret });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/disputes', rateLimit(15, 60_000), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          subOrderId: z.string().min(1),
+          reason: z.string().min(5).max(1500),
+          orderNumber: z.string().max(60).optional(),
+          phone: z.string().max(40).optional(),
+        }),
+        req.body
+      );
+      const dispute = await repo.createDispute({
+        subOrderId: body.subOrderId,
+        userId: req.authUser?.id || null,
+        orderNumber: body.orderNumber,
+        phone: body.phone,
+        reason: body.reason,
+      });
+      res.status(201).json({ dispute });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
     }
   });
 
@@ -741,20 +1037,41 @@ async function createApp() {
 
   app.patch('/api/seller/profile', requireSeller, async (req, res) => {
     try {
-      const sellerId = req.authUser!.sellerId!;
+      const sellerId = resolveTargetSellerId(req);
+      if (!sellerId) return res.status(400).json({ error: 'Seller ID required.' });
       const body = validateBody(
         z.object({
           taglineEn: z.string().max(190).optional(),
           taglineAr: z.string().max(190).optional(),
-          aboutEn: z.string().max(1500).optional(),
-          aboutAr: z.string().max(1500).optional(),
+          aboutEn: z.string().max(2000).optional(),
+          aboutAr: z.string().max(2000).optional(),
+          announcementEn: z.string().max(240).optional(),
+          announcementAr: z.string().max(240).optional(),
+          returnPolicyEn: z.string().max(1200).optional(),
+          returnPolicyAr: z.string().max(1200).optional(),
+          processingHours: z.number().int().min(1).max(360).optional(),
+          vacationMode: z.boolean().optional(),
+          seoTitle: z.string().max(160).optional(),
+          seoDescription: z.string().max(320).optional(),
           storefrontTheme: z.enum(['obsidian-ember', 'sand-atelier', 'cyan-lab', 'sage-studio']).optional(),
           deliveryMode: z.enum(['platform', 'self']).optional(),
+          selfDeliveryFeesUsdCents: z.record(z.string(), z.number().int().min(0).max(50000)).optional(),
+          payoutMethod: z.enum(['whish', 'omt', 'bank']).optional(),
+          payoutAccount: z.string().min(3).max(180).optional(),
+          whatsappPhone: z.string().min(6).max(40).optional(),
           bannerMediaId: z.string().optional(),
           logoMediaId: z.string().optional(),
         }),
         req.body
       );
+      if (
+        (body.payoutMethod !== undefined || body.payoutAccount !== undefined) &&
+        !isAdminRole(req.authUser!.roleKey) &&
+        req.authUser!.roleKey !== 'seller_owner' &&
+        !hasPermission(req.authUser, 'seller.finance')
+      ) {
+        return res.status(403).json({ error: 'Only store owner or finance staff can update payout settings.' });
+      }
       const seller = await repo.updateSellerProfile(sellerId, req.authUser!.id, body, getClientIp(req));
       res.json({ seller });
     } catch (err) {
@@ -762,9 +1079,25 @@ async function createApp() {
     }
   });
 
-  app.post('/api/seller/products', requireSeller, async (req, res) => {
+  const ProductSpecSchema = z.object({
+    key: z.object({ en: z.string().max(120), ar: z.string().max(120) }),
+    value: z.object({ en: z.string().max(240), ar: z.string().max(240) }),
+  });
+
+  const ProductVariantInputSchema = z.object({
+    id: z.string().optional(),
+    sku: z.string().min(2).max(80),
+    size: z.string().max(40).optional(),
+    color: z.string().min(1).max(60),
+    colorHex: z.string().max(20).optional(),
+    stock: z.number().int().min(0).max(100000),
+    priceDeltaUsdCents: z.number().int().min(-500000).max(500000).optional(),
+  });
+
+  app.post('/api/seller/products', requireSellerPerm('seller.catalog'), async (req, res) => {
     try {
-      const sellerId = req.authUser!.sellerId!;
+      const sellerId = resolveTargetSellerId(req);
+      if (!sellerId) return res.status(400).json({ error: 'Seller ID required.' });
       const body = validateBody(
         z.object({
           titleEn: z.string().min(2).max(180),
@@ -776,11 +1109,16 @@ async function createApp() {
           basePriceUsdCents: z.number().int().positive(),
           compareAtUsdCents: z.number().int().positive().nullable().optional(),
           department: z.enum(['fashion', 'electronics', 'home-gadgets']).optional(),
+          categoryId: z.string().max(100).optional(),
+          brandId: z.string().max(100).nullable().optional(),
+          specs: z.array(ProductSpecSchema).optional(),
+          model3dUrl: z.string().max(400).nullable().optional(),
           sku: z.string().min(2).max(80),
           size: z.string().optional(),
           color: z.string().optional(),
           colorHex: z.string().optional(),
           stock: z.number().int().min(0).max(100000),
+          variants: z.array(ProductVariantInputSchema).optional(),
           mediaIds: z.array(z.string()).optional(),
           published: z.boolean().optional(),
         }),
@@ -793,21 +1131,61 @@ async function createApp() {
     }
   });
 
-  app.patch('/api/seller/products/:id/toggle', requireSeller, async (req, res) => {
+  app.patch('/api/seller/products/:id', requireSellerPerm('seller.catalog'), async (req, res) => {
     try {
-      const product = await repo.toggleProductPublished(
-        req.authUser!.sellerId!,
-        req.params.id,
-        req.authUser!.id,
-        getClientIp(req)
+      const sellerId = resolveTargetSellerId(req);
+      if (!sellerId) return res.status(400).json({ error: 'Seller ID required.' });
+      const body = validateBody(
+        z.object({
+          titleEn: z.string().min(2).max(180).optional(),
+          titleAr: z.string().max(180).optional(),
+          subtitleEn: z.string().max(240).optional(),
+          subtitleAr: z.string().max(240).optional(),
+          descriptionEn: z.string().max(4000).optional(),
+          descriptionAr: z.string().max(4000).optional(),
+          basePriceUsdCents: z.number().int().positive().optional(),
+          compareAtUsdCents: z.number().int().positive().nullable().optional(),
+          department: z.enum(['fashion', 'electronics', 'home-gadgets']).optional(),
+          categoryId: z.string().max(100).optional(),
+          brandId: z.string().max(100).nullable().optional(),
+          specs: z.array(ProductSpecSchema).optional(),
+          model3dUrl: z.string().max(400).nullable().optional(),
+          published: z.boolean().optional(),
+          mediaIds: z.array(z.string()).optional(),
+          variants: z.array(ProductVariantInputSchema.extend({ colorHex: z.string().max(20).default('#1C1D21') })).optional(),
+        }),
+        req.body
       );
+      const product = await repo.updateSellerProduct(sellerId, req.params.id, req.authUser!.id, body, getClientIp(req));
       res.json({ product });
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
     }
   });
 
-  app.patch('/api/seller/sub-orders/:id', requireSeller, async (req, res) => {
+  app.delete('/api/seller/products/:id', requireSellerPerm('seller.catalog'), async (req, res) => {
+    try {
+      const sellerId = resolveTargetSellerId(req);
+      if (!sellerId) return res.status(400).json({ error: 'Seller ID required.' });
+      await repo.deleteSellerProduct(sellerId, req.params.id, req.authUser!.id, getClientIp(req));
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.patch('/api/seller/products/:id/toggle', requireSellerPerm('seller.catalog'), async (req, res) => {
+    try {
+      const sellerId = resolveTargetSellerId(req);
+      if (!sellerId) return res.status(400).json({ error: 'Seller ID required.' });
+      const product = await repo.toggleProductPublished(sellerId, req.params.id, req.authUser!.id, getClientIp(req));
+      res.json({ product });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.patch('/api/seller/sub-orders/:id', requireSellerPerm('seller.orders'), async (req, res) => {
     try {
       const body = validateBody(
         z.object({
@@ -825,8 +1203,22 @@ async function createApp() {
     }
   });
 
-  app.post('/api/seller/coupons', requireSeller, async (req, res) => {
+  app.patch('/api/seller/returns/:id', requireSellerPerm('seller.orders'), async (req, res) => {
     try {
+      const sellerId = resolveTargetSellerId(req);
+      if (!sellerId) return res.status(400).json({ error: 'Seller ID required.' });
+      const body = validateBody(z.object({ status: z.enum(['approved', 'rejected']) }), req.body);
+      const ret = await repo.sellerUpdateReturn(sellerId, req.authUser!.id, req.params.id, body, getClientIp(req));
+      res.json({ returnRequest: ret });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/seller/coupons', requireSellerPerm('seller.catalog', 'seller.finance'), async (req, res) => {
+    try {
+      const sellerId = resolveTargetSellerId(req);
+      if (!sellerId) return res.status(400).json({ error: 'Seller ID required.' });
       const body = validateBody(
         z.object({
           code: z.string().min(3).max(40),
@@ -835,40 +1227,95 @@ async function createApp() {
         }),
         req.body
       );
-      const coupon = await repo.createCoupon(req.authUser!.sellerId!, req.authUser!.id, body, getClientIp(req));
+      const coupon = await repo.createCoupon(sellerId, req.authUser!.id, body, getClientIp(req));
       res.status(201).json({ coupon });
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
     }
   });
 
-  app.post('/api/seller/payouts', requireSeller, async (req, res) => {
+  app.post('/api/seller/payouts', requireSellerPerm('seller.finance'), async (req, res) => {
     try {
+      const sellerId = resolveTargetSellerId(req);
+      if (!sellerId) return res.status(400).json({ error: 'Seller ID required.' });
       const body = validateBody(z.object({ amountUsdCents: z.number().int().min(1000) }), req.body);
-      const payout = await repo.requestPayout(
-        req.authUser!.sellerId!,
-        req.authUser!.id,
-        body.amountUsdCents,
-        getClientIp(req)
-      );
+      const payout = await repo.requestPayout(sellerId, req.authUser!.id, body.amountUsdCents, getClientIp(req));
       res.status(201).json({ payout });
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
     }
   });
 
-  app.post('/api/seller/reviews/:id/reply', requireSeller, async (req, res) => {
+  app.post('/api/seller/plan', requireSellerOwnerOrAdmin, async (req, res) => {
     try {
+      const sellerId = resolveTargetSellerId(req);
+      if (!sellerId) return res.status(400).json({ error: 'Seller ID required.' });
+      const body = validateBody(z.object({ planTier: z.enum(['free', 'basic', 'pro']) }), req.body);
+      const result = await repo.switchSellerPlan(sellerId, req.authUser!.id, body.planTier, getClientIp(req));
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.get('/api/seller/staff', requireSellerOwnerOrAdmin, async (req, res, next) => {
+    try {
+      const sellerId = resolveTargetSellerId(req);
+      if (!sellerId) return res.status(400).json({ error: 'Seller ID required.' });
+      res.json({ staff: await repo.listSellerStaff(sellerId) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/seller/staff', requireSellerOwnerOrAdmin, async (req, res) => {
+    try {
+      const sellerId = resolveTargetSellerId(req);
+      if (!sellerId) return res.status(400).json({ error: 'Seller ID required.' });
+      const body = validateBody(
+        z.object({
+          name: z.string().min(2).max(140),
+          email: z.string().email().max(180),
+          phone: z.string().min(7).max(40),
+          password: z.string().min(8).max(128),
+          permissions: z.array(z.enum(['seller.catalog', 'seller.orders', 'seller.finance'])).min(1),
+        }),
+        req.body
+      );
+      const member = await repo.createSellerStaff(sellerId, req.authUser!.id, body, getClientIp(req));
+      res.status(201).json({ member });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.delete('/api/seller/staff/:userId', requireSellerOwnerOrAdmin, async (req, res) => {
+    try {
+      const sellerId = resolveTargetSellerId(req);
+      if (!sellerId) return res.status(400).json({ error: 'Seller ID required.' });
+      await repo.removeSellerStaff(sellerId, req.params.userId, req.authUser!.id, getClientIp(req));
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/seller/reviews/:id/reply', requireSellerPerm('seller.orders', 'seller.catalog'), async (req, res) => {
+    try {
+      const sellerId = resolveTargetSellerId(req);
+      if (!sellerId) return res.status(400).json({ error: 'Seller ID required.' });
       const body = validateBody(z.object({ reply: z.string().min(2).max(1000) }), req.body);
-      const review = await repo.replyToReview(req.authUser!.sellerId!, req.params.id, body.reply);
+      const review = await repo.replyToReview(sellerId, req.params.id, body.reply);
       res.json({ review });
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
     }
   });
 
-  app.post('/api/seller/offers', requireSeller, async (req, res) => {
+  app.post('/api/seller/offers', requireSellerPerm('seller.catalog'), async (req, res) => {
     try {
+      const sellerId = resolveTargetSellerId(req);
+      if (!sellerId) return res.status(400).json({ error: 'Seller ID required.' });
       const body = validateBody(
         z.object({
           titleEn: z.string().min(2).max(140),
@@ -883,7 +1330,7 @@ async function createApp() {
         req.body
       );
       const offer = await repo.sellerProposeOffer(
-        req.authUser!.sellerId!,
+        sellerId,
         req.authUser!.id,
         {
           title: { en: body.titleEn.trim(), ar: (body.titleAr || body.titleEn).trim() },
@@ -986,18 +1433,124 @@ async function createApp() {
     }
   });
 
-  app.post('/api/admin/coupons', requireAdminPerm('content.manage'), async (req, res) => {
+  const CouponDiscountTypeSchema = z.enum(['percent', 'fixed_usd_cents', 'free_shipping']);
+
+  app.post('/api/admin/coupons', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
     try {
       const body = validateBody(
         z.object({
           code: z.string().min(3).max(40),
-          discountPercent: z.number().int().min(1).max(80),
+          discountType: CouponDiscountTypeSchema.default('percent'),
+          discountValue: z.number().int().min(0).optional(),
+          discountPercent: z.number().int().min(1).max(90).optional(),
+          maxDiscountUsdCents: z.number().int().positive().nullable().optional(),
           minOrderUsdCents: z.number().int().min(0).optional(),
+          targetType: z.enum(['all', 'department', 'category', 'seller', 'product']).optional(),
+          targetId: z.string().max(100).nullable().optional(),
+          campaignId: z.string().max(100).nullable().optional(),
+          maxUses: z.number().int().positive().nullable().optional(),
+          perCustomerLimit: z.number().int().min(1).max(100).optional(),
+          firstOrderOnly: z.boolean().optional(),
+          startsAt: z.string().nullable().optional(),
+          endsAt: z.string().nullable().optional(),
+          active: z.boolean().optional(),
         }),
         req.body
       );
       const coupon = await repo.createCoupon(null, req.authUser!.id, body, getClientIp(req));
       res.status(201).json({ coupon });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/admin/coupons/bulk', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          prefix: z.string().min(2).max(20),
+          count: z.number().int().min(1).max(200),
+          discountType: CouponDiscountTypeSchema.default('percent'),
+          discountValue: z.number().int().min(0),
+          minOrderUsdCents: z.number().int().min(0).optional(),
+          maxDiscountUsdCents: z.number().int().positive().nullable().optional(),
+          perCustomerLimit: z.number().int().min(1).max(100).optional(),
+          maxUsesPerCode: z.number().int().positive().nullable().optional(),
+          startsAt: z.string().nullable().optional(),
+          endsAt: z.string().nullable().optional(),
+          campaignId: z.string().max(100).nullable().optional(),
+        }),
+        req.body
+      );
+      const result = await repo.adminGenerateBulkCoupons(req.authUser!.id, body, getClientIp(req));
+      res.status(201).json(result);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/admin/coupons/import-csv', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(z.object({ csvText: z.string().min(3).max(200000) }), req.body);
+      const result = await repo.adminImportCouponsCsv(req.authUser!.id, body.csvText, getClientIp(req));
+      res.status(201).json(result);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.get('/api/admin/coupons/export-csv', requireAdminPerm('marketing.view', 'marketing.manage', 'content.manage'), async (_req, res, next) => {
+    try {
+      const csv = await repo.adminExportCouponsCsv();
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', 'attachment; filename="nilelink-coupons.csv"');
+      res.send(csv);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.patch('/api/admin/coupons/:id', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          active: z.boolean().optional(),
+          maxUses: z.number().int().positive().nullable().optional(),
+          endsAt: z.string().nullable().optional(),
+        }),
+        req.body
+      );
+      const coupon = await repo.adminUpdateCoupon(req.params.id, req.authUser!.id, body, getClientIp(req));
+      res.json({ coupon });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.delete('/api/admin/coupons/:id', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      await repo.adminDeleteCoupon(req.params.id, req.authUser!.id, getClientIp(req));
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/admin/pages', requireAdminPerm('content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          slug: z.string().min(2).max(80),
+          titleEn: z.string().min(2).max(160),
+          titleAr: z.string().min(1).max(160),
+          bodyEn: z.string().min(2).max(20000),
+          bodyAr: z.string().min(1).max(20000),
+          published: z.boolean().optional(),
+        }),
+        req.body
+      );
+      const page = await repo.adminCreatePage(req.authUser!.id, body, getClientIp(req));
+      res.status(201).json({ page });
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
     }
@@ -1017,6 +1570,285 @@ async function createApp() {
       );
       const page = await repo.adminUpdatePage(req.params.slug, req.authUser!.id, body, getClientIp(req));
       res.json({ page });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.delete('/api/admin/pages/:slug', requireAdminPerm('content.manage'), async (req, res) => {
+    try {
+      await repo.adminDeletePage(req.params.slug, req.authUser!.id, getClientIp(req));
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  // --- Admin Phase C Operations, Catalog Moderation, Taxonomies, KYC, Settings & Users ---
+  app.patch('/api/admin/products/:id', requireAdminPerm('products.approve'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          moderationStatus: z.enum(['pending', 'approved', 'rejected']).optional(),
+          published: z.boolean().optional(),
+          featured: z.boolean().optional(),
+        }),
+        req.body
+      );
+      const product = await repo.adminModerateProduct(req.params.id, req.authUser!.id, body, getClientIp(req));
+      res.json({ product });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/admin/categories', requireAdminPerm('settings.manage', 'products.approve'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          slug: z.string().min(2).max(80),
+          parentId: z.string().max(80).nullable().optional(),
+          department: z.enum(['fashion', 'electronics', 'home-gadgets']),
+          name: z.object({ en: z.string().min(2).max(120), ar: z.string().min(1).max(120) }),
+          commissionBps: z.number().int().min(0).max(5000).nullable().optional(),
+          sortOrder: z.number().int().optional(),
+        }),
+        req.body
+      );
+      const category = await repo.adminCreateCategory(req.authUser!.id, body, getClientIp(req));
+      res.status(201).json({ category });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.patch('/api/admin/categories/:id', requireAdminPerm('settings.manage', 'products.approve'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          name: z.object({ en: z.string().min(2).max(120), ar: z.string().min(1).max(120) }).optional(),
+          commissionBps: z.number().int().min(0).max(5000).nullable().optional(),
+          sortOrder: z.number().int().optional(),
+          active: z.boolean().optional(),
+        }),
+        req.body
+      );
+      const category = await repo.adminUpdateCategory(req.params.id, req.authUser!.id, body, getClientIp(req));
+      res.json({ category });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.delete('/api/admin/categories/:id', requireAdminPerm('settings.manage', 'products.approve'), async (req, res) => {
+    try {
+      await repo.adminDeleteCategory(req.params.id, req.authUser!.id, getClientIp(req));
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/admin/brands', requireAdminPerm('products.approve', 'settings.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          slug: z.string().min(2).max(80),
+          name: z.object({ en: z.string().min(2).max(120), ar: z.string().min(1).max(120) }),
+        }),
+        req.body
+      );
+      const brand = await repo.adminCreateBrand(req.authUser!.id, body, getClientIp(req));
+      res.status(201).json({ brand });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.delete('/api/admin/brands/:id', requireAdminPerm('products.approve', 'settings.manage'), async (req, res) => {
+    try {
+      await repo.adminDeleteBrand(req.params.id, req.authUser!.id, getClientIp(req));
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/admin/attributes', requireAdminPerm('products.approve', 'settings.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          code: z.string().min(2).max(60),
+          name: z.object({ en: z.string().min(2).max(120), ar: z.string().min(1).max(120) }),
+          values: z.array(z.string().min(1).max(80)).min(1),
+        }),
+        req.body
+      );
+      const attribute = await repo.adminCreateAttribute(req.authUser!.id, body, getClientIp(req));
+      res.status(201).json({ attribute });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.delete('/api/admin/attributes/:id', requireAdminPerm('products.approve', 'settings.manage'), async (req, res) => {
+    try {
+      await repo.adminDeleteAttribute(req.params.id, req.authUser!.id, getClientIp(req));
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.patch('/api/admin/seller-documents/:id', requireAdminPerm('sellers.approve'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          reviewStatus: z.enum(['approved', 'rejected']),
+          reviewerNote: z.string().max(400).optional(),
+        }),
+        req.body
+      );
+      const doc = await repo.adminReviewSellerDocument(req.params.id, req.authUser!.id, body, getClientIp(req));
+      res.json({ document: doc });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.patch('/api/admin/returns/:id', requireAdminPerm('orders.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          status: z.enum(['approved', 'rejected', 'refunded']),
+          refundUsdCents: z.number().int().min(0).optional(),
+        }),
+        req.body
+      );
+      const ret = await repo.adminResolveReturn(req.params.id, req.authUser!.id, body, getClientIp(req));
+      res.json({ returnRequest: ret });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.patch('/api/admin/disputes/:id', requireAdminPerm('orders.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          status: z.enum(['open', 'investigating', 'resolved_buyer', 'resolved_seller', 'closed']),
+          resolutionNote: z.string().max(1200).optional(),
+        }),
+        req.body
+      );
+      const dispute = await repo.adminResolveDispute(req.params.id, req.authUser!.id, body, getClientIp(req));
+      res.json({ dispute });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.patch('/api/admin/reviews/:id', requireAdminPerm('products.approve', 'content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(z.object({ status: z.enum(['approved', 'hidden', 'rejected']) }), req.body);
+      const review = await repo.adminModerateReview(req.params.id, req.authUser!.id, body.status, getClientIp(req));
+      res.json({ review });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.patch('/api/admin/support-tickets/:id', requireAdminPerm('orders.manage', 'users.manage'), async (req, res) => {
+    try {
+      const body = validateBody(z.object({ status: z.enum(['open', 'in_progress', 'resolved', 'closed']) }), req.body);
+      const ticket = await repo.adminUpdateSupportTicket(req.params.id, req.authUser!.id, body.status, getClientIp(req));
+      res.json({ ticket });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.patch('/api/admin/delivery-zones/:code', requireAdminPerm('settings.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          platformFeeUsdCents: z.number().int().min(0).max(50000).optional(),
+          etaDays: z.string().min(1).max(60).optional(),
+        }),
+        req.body
+      );
+      const zone = await repo.adminUpdateDeliveryZone(req.params.code, req.authUser!.id, body, getClientIp(req));
+      res.json({ deliveryZone: zone });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.patch('/api/admin/subscription-plans/:tier', requireAdminPerm('settings.manage'), async (req, res) => {
+    try {
+      const tier = validateBody(z.enum(['free', 'basic', 'pro']), req.params.tier);
+      const body = validateBody(
+        z.object({
+          monthlyFeeUsdCents: z.number().int().min(0).max(500000).optional(),
+          productLimit: z.number().int().min(1).max(100000).nullable().optional(),
+          commissionDiscountBps: z.number().int().min(0).max(2000).optional(),
+        }),
+        req.body
+      );
+      const plan = await repo.adminUpdateSubscriptionPlan(tier, req.authUser!.id, body, getClientIp(req));
+      res.json({ plan });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.put('/api/admin/email-templates/:key', requireAdminPerm('settings.manage', 'content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          subject: z.object({ en: z.string().min(2).max(240), ar: z.string().min(1).max(240) }),
+          body: z.object({ en: z.string().min(2).max(8000), ar: z.string().min(1).max(8000) }),
+        }),
+        req.body
+      );
+      const template = await repo.adminUpdateEmailTemplate(req.params.key, req.authUser!.id, body, getClientIp(req));
+      res.json({ template });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.put('/api/admin/menus/:location', requireAdminPerm('content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          items: z.array(
+            z.object({
+              label: z.object({ en: z.string().min(1).max(80), ar: z.string().min(1).max(80) }),
+              url: z.string().min(1).max(300),
+            })
+          ),
+        }),
+        req.body
+      );
+      const menu = await repo.adminSaveMenu(req.params.location, req.authUser!.id, body.items, getClientIp(req));
+      res.json({ menu });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.patch('/api/admin/users/:id/access', requireAdminPerm('users.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          isBlocked: z.boolean().optional(),
+          permissions: z.array(z.string().min(1).max(80)).optional(),
+        }),
+        req.body
+      );
+      const result = await repo.adminUpdateUserAccess(req.params.id, req.authUser!.id, body, getClientIp(req));
+      res.json(result);
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
     }
@@ -1576,29 +2408,105 @@ async function createApp() {
     }
   });
 
-  app.post('/api/admin/offers', requireAdminPerm('content.manage'), async (req, res) => {
+  const OfferTypeSchema = z.enum([
+    'percent',
+    'fixed_usd_cents',
+    'flash_percent',
+    'bogo',
+    'buy_x_get_y',
+    'tiered_qty',
+    'cart_threshold',
+    'bundle_deal',
+    'free_shipping',
+    'first_order',
+    'vip_exclusive',
+  ]);
+  const OfferTargetTypeSchema = z.enum(['all', 'department', 'category', 'seller', 'product']);
+  const OfferStackingRuleSchema = z.enum(['best_only', 'stackable', 'exclusive']);
+  const OfferFundingSourceSchema = z.enum(['platform', 'seller', 'shared']);
+  const OfferRulesSchema = z
+    .object({
+      buyQty: z.number().int().min(1).max(50).optional(),
+      getQty: z.number().int().min(1).max(50).optional(),
+      getDiscountPct: z.number().int().min(1).max(100).optional(),
+      tiers: z
+        .array(
+          z.object({
+            minQty: z.number().int().min(1).max(1000),
+            discountPercent: z.number().int().min(1).max(90),
+          })
+        )
+        .optional(),
+      minCartUsdCents: z.number().int().min(0).optional(),
+      maxDiscountUsdCents: z.number().int().positive().nullable().optional(),
+      bundleProductIds: z.array(z.string().min(1)).optional(),
+      bundleDiscountPct: z.number().int().min(1).max(90).optional(),
+      freeDeliveryCapUsdCents: z.number().int().positive().nullable().optional(),
+      audience: MarketingAudienceSchema.optional(),
+      flashStockCap: z.number().int().min(0).nullable().optional(),
+    })
+    .optional();
+
+  app.post('/api/admin/offers/check-conflicts', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          offerType: OfferTypeSchema,
+          targetType: OfferTargetTypeSchema,
+          targetId: z.string().nullable().optional(),
+          stackingRule: OfferStackingRuleSchema.optional(),
+          startsAt: z.string().nullable().optional(),
+          endsAt: z.string().nullable().optional(),
+          excludeOfferId: z.string().optional(),
+        }),
+        req.body
+      );
+      const conflicts = await repo.checkOfferConflicts({
+        ...body,
+        offerType: body.offerType as OfferType,
+      });
+      res.json({ conflicts });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/admin/offers', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
     try {
       const body = validateBody(
         z.object({
           title: z.object({ en: z.string().min(2).max(160), ar: z.string().min(1).max(160) }),
-          offerType: z.enum(['percent', 'fixed_usd_cents', 'flash_percent']),
-          discountValue: z.number().int().positive(),
-          targetType: z.enum(['all', 'department', 'category', 'seller', 'product']),
+          offerType: OfferTypeSchema,
+          discountValue: z.number().int().min(0),
+          targetType: OfferTargetTypeSchema,
           targetId: z.string().nullable().optional(),
+          stackingRule: OfferStackingRuleSchema.optional(),
+          fundingSource: OfferFundingSourceSchema.optional(),
+          fundingPlatformBps: z.number().int().min(0).max(10000).optional(),
+          campaignId: z.string().max(100).nullable().optional(),
+          priority: z.number().int().min(-100).max(1000).optional(),
+          rules: OfferRulesSchema,
           startsAt: z.string().nullable().optional(),
           endsAt: z.string().nullable().optional(),
           active: z.boolean().optional(),
         }),
         req.body
       );
-      const offer = await repo.adminCreateOffer(req.authUser!.id, body, getClientIp(req));
+      const offer = await repo.adminCreateOffer(
+        req.authUser!.id,
+        {
+          ...body,
+          offerType: body.offerType as OfferType,
+        },
+        getClientIp(req)
+      );
       res.status(201).json({ offer });
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
     }
   });
 
-  app.patch('/api/admin/offers/:id', requireAdminPerm('content.manage'), async (req, res) => {
+  app.patch('/api/admin/offers/:id', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
     try {
       const body = validateBody(
         z.object({
@@ -1614,12 +2522,444 @@ async function createApp() {
     }
   });
 
-  app.delete('/api/admin/offers/:id', requireAdminPerm('content.manage'), async (req, res) => {
+  app.delete('/api/admin/offers/:id', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
     try {
       await repo.adminDeleteOffer(req.params.id, req.authUser!.id, getClientIp(req));
       res.json({ ok: true });
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  // --- Flash Sales & Stock Caps ---
+  app.get('/api/admin/flash-sales', requireAdminPerm('marketing.view', 'marketing.manage', 'content.manage'), async (_req, res, next) => {
+    try {
+      res.json({ flashSales: await repo.adminListFlashSales() });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/admin/flash-sales', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          slug: z.string().max(120).optional(),
+          title: z.object({ en: z.string().min(2).max(200), ar: z.string().min(1).max(200) }),
+          bgToken: BannerBgSchema.default('ember'),
+          startsAt: z.string().min(4),
+          endsAt: z.string().min(4),
+          autoRevert: z.boolean().default(true),
+          items: z
+            .array(
+              z.object({
+                productId: z.string().min(1),
+                discountPercent: z.number().int().min(1).max(90),
+                stockCap: z.number().int().min(0).max(100000),
+              })
+            )
+            .min(1),
+        }),
+        req.body
+      );
+      const flashSale = await repo.adminCreateFlashSale(req.authUser!.id, body, getClientIp(req));
+      res.status(201).json({ flashSale });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.patch('/api/admin/flash-sales/:id', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          status: z.enum(['scheduled', 'active', 'ended']),
+        }),
+        req.body
+      );
+      const flashSale = await repo.adminUpdateFlashSaleStatus(req.params.id, req.authUser!.id, body.status, getClientIp(req));
+      res.json({ flashSale });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.delete('/api/admin/flash-sales/:id', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      await repo.adminDeleteFlashSale(req.params.id, req.authUser!.id, getClientIp(req));
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  // --- Marketing Campaigns ---
+  const CampaignStatusSchema = z.enum(['draft', 'scheduled', 'active', 'ended']);
+  const SafeOptionalAssetUrlSchema = z
+    .string()
+    .max(500)
+    .refine((v) => !v || !/^\s*(javascript|data|vbscript):/i.test(v), 'Unsafe URL scheme')
+    .nullable()
+    .optional();
+
+  app.get('/api/admin/campaigns', requireAdminPerm('marketing.view', 'marketing.manage', 'content.manage'), async (_req, res, next) => {
+    try {
+      res.json({ campaigns: await repo.adminListCampaigns() });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/admin/campaigns', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          slug: z.string().min(2).max(120),
+          title: z.object({ en: z.string().min(2).max(200), ar: z.string().min(1).max(200) }),
+          subtitle: z.object({ en: z.string().max(300), ar: z.string().max(300) }).default({ en: '', ar: '' }),
+          description: z.object({ en: z.string().max(2000), ar: z.string().max(2000) }).default({ en: '', ar: '' }),
+          heroImageUrl: SafeOptionalAssetUrlSchema,
+          bgToken: BannerBgSchema.default('ember'),
+          startsAt: z.string().nullable().optional(),
+          endsAt: z.string().nullable().optional(),
+          status: CampaignStatusSchema.default('active'),
+          featuredOfferIds: z.array(z.string()).default([]),
+          featuredCouponCodes: z.array(z.string()).default([]),
+          featuredFlashSaleId: z.string().nullable().optional(),
+        }),
+        req.body
+      );
+      const campaign = await repo.adminCreateCampaign(req.authUser!.id, body, getClientIp(req));
+      res.status(201).json({ campaign });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.patch('/api/admin/campaigns/:id', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          title: z.object({ en: z.string().min(2).max(200), ar: z.string().min(1).max(200) }).optional(),
+          subtitle: z.object({ en: z.string().max(300), ar: z.string().max(300) }).optional(),
+          description: z.object({ en: z.string().max(2000), ar: z.string().max(2000) }).optional(),
+          heroImageUrl: SafeOptionalAssetUrlSchema,
+          bgToken: BannerBgSchema.optional(),
+          startsAt: z.string().nullable().optional(),
+          endsAt: z.string().nullable().optional(),
+          status: CampaignStatusSchema.optional(),
+          featuredOfferIds: z.array(z.string()).optional(),
+          featuredCouponCodes: z.array(z.string()).optional(),
+          featuredFlashSaleId: z.string().nullable().optional(),
+        }),
+        req.body
+      );
+      const campaign = await repo.adminUpdateCampaign(req.params.id, req.authUser!.id, body, getClientIp(req));
+      res.json({ campaign });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.delete('/api/admin/campaigns/:id', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      await repo.adminDeleteCampaign(req.params.id, req.authUser!.id, getClientIp(req));
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  // --- Step 5: Segments, Newsletter Subscribers, Email Block Campaigns & Automations ---
+  const SegmentRuleSchema = z.object({
+    audienceScope: z.enum(['all_contacts', 'newsletter_subscribers', 'registered_customers']).default('all_contacts'),
+    governorate: z.string().max(64).optional(),
+    minOrderCount: z.number().int().min(0).optional(),
+    maxOrderCount: z.number().int().min(0).optional(),
+    minTotalSpentUsdCents: z.number().int().min(0).optional(),
+    daysSinceLastOrder: z.number().int().min(0).optional(),
+    locale: z.enum(['all', 'en', 'ar']).optional(),
+  });
+
+  const SafeEmailBlockUrlSchema = z
+    .string()
+    .max(500)
+    .refine((v) => !v || !/^\s*(javascript|data|vbscript):/i.test(v), 'Unsafe URL scheme')
+    .optional();
+
+  const EmailBlockSchema = z.object({
+    id: z.string().min(1).max(64),
+    type: z.enum(['header', 'hero_text', 'product_spotlight', 'coupon_box', 'cta_button', 'divider_footer']),
+    titleEn: z.string().max(500).optional(),
+    titleAr: z.string().max(500).optional(),
+    bodyEn: z.string().max(4000).optional(),
+    bodyAr: z.string().max(4000).optional(),
+    imageUrl: SafeEmailBlockUrlSchema,
+    buttonLabelEn: z.string().max(120).optional(),
+    buttonLabelAr: z.string().max(120).optional(),
+    buttonUrl: SafeEmailBlockUrlSchema,
+    couponCode: z.string().max(64).optional(),
+    productIds: z.array(z.string().max(64)).max(24).optional(),
+  });
+
+  app.get('/api/admin/segments', requireAdminPerm('marketing.view', 'marketing.manage', 'content.manage'), async (_req, res, next) => {
+    try {
+      res.json({ segments: await repo.adminListSegments() });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/admin/segments/preview', requireAdminPerm('marketing.view', 'marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      const rules = validateBody(SegmentRuleSchema, req.body);
+      const preview = await repo.adminPreviewSegment(rules);
+      res.json(preview);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/admin/segments', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          name: z.object({ en: z.string().min(2).max(160), ar: z.string().min(1).max(160) }),
+          description: z.string().max(400).default(''),
+          rules: SegmentRuleSchema,
+        }),
+        req.body
+      );
+      const segment = await repo.adminCreateSegment(req.authUser!.id, body, getClientIp(req));
+      res.status(201).json({ segment });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.delete('/api/admin/segments/:id', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      await repo.adminDeleteSegment(req.params.id, req.authUser!.id, getClientIp(req));
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.get('/api/admin/newsletter/subscribers', requireAdminPerm('marketing.view', 'marketing.manage', 'content.manage'), async (_req, res, next) => {
+    try {
+      res.json({ subscribers: await repo.adminListNewsletterSubscribers() });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/api/admin/email-campaigns', requireAdminPerm('marketing.view', 'marketing.manage', 'content.manage'), async (_req, res, next) => {
+    try {
+      res.json({ emailCampaigns: await repo.adminListEmailCampaigns() });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/admin/email-campaigns/preview', requireAdminPerm('marketing.view', 'marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          locale: z.enum(['en', 'ar']).default('en'),
+          subject: z.string().max(240).default('Preview'),
+          previewText: z.string().max(240).optional(),
+          blocks: z.array(EmailBlockSchema).default([]),
+          attachCouponCode: z.string().max(64).nullable().optional(),
+        }),
+        req.body
+      );
+      const productIds = Array.from(new Set(body.blocks.flatMap((b) => b.productIds || [])));
+      const products: Array<{ id: string; slug: string; titleEn: string; titleAr: string; priceUsdCents: number }> = [];
+      if (productIds.length > 0) {
+        const placeholders = productIds.map(() => '?').join(', ');
+        const rows = await db.query<{ id: string; slug: string; title_json: string; base_price_usd_cents: number }>(
+          `SELECT id, slug, title_json, base_price_usd_cents FROM products WHERE id IN (${placeholders})`,
+          productIds
+        );
+        for (const r of rows) {
+          const tj = typeof r.title_json === 'string' ? JSON.parse(r.title_json) : r.title_json;
+          products.push({
+            id: r.id,
+            slug: r.slug,
+            titleEn: String(tj?.en || 'Product'),
+            titleAr: String(tj?.ar || tj?.en || 'منتج'),
+            priceUsdCents: Number(r.base_price_usd_cents || 0),
+          });
+        }
+      }
+      const rendered = renderEmailBlocks(body.blocks, {
+        locale: body.locale,
+        subject: body.subject,
+        previewText: body.previewText,
+        products,
+        attachCouponCode: body.attachCouponCode,
+        unsubscribeUrl: '/api/newsletter/unsubscribe?token=preview',
+        appUrl: process.env.APP_URL || `${req.protocol}://${req.get('host')}`,
+      });
+      res.json(rendered);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/admin/email-campaigns', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          name: z.string().min(2).max(160),
+          subject: z.object({ en: z.string().min(1).max(220), ar: z.string().min(1).max(220) }),
+          previewText: z.object({ en: z.string().max(240), ar: z.string().max(240) }).default({ en: '', ar: '' }),
+          segmentId: z.string().max(64).nullable().optional(),
+          blocks: z.array(EmailBlockSchema).min(1),
+          scheduledAt: z.string().nullable().optional(),
+        }),
+        req.body
+      );
+      const campaign = await repo.adminCreateEmailCampaign(req.authUser!.id, body, getClientIp(req));
+      res.status(201).json({ emailCampaign: campaign });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/admin/email-campaigns/:id/send', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          sendNow: z.boolean().optional(),
+          scheduledAt: z.string().nullable().optional(),
+        }),
+        req.body
+      );
+      const result = await repo.adminSendOrScheduleEmailCampaign(req.params.id, req.authUser!.id, body, getClientIp(req));
+      let jobSummary = null;
+      if (body.sendNow) {
+        jobSummary = await processPendingJobs(db, Math.max(50, result.queuedCount + 10));
+        const refreshed = (await repo.adminListEmailCampaigns()).find((c) => c.id === req.params.id);
+        return res.json({ emailCampaign: refreshed || result.campaign, queuedCount: result.queuedCount, jobSummary });
+      }
+      res.json({ ...result, jobSummary });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.delete('/api/admin/email-campaigns/:id', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      await repo.adminDeleteEmailCampaign(req.params.id, req.authUser!.id, getClientIp(req));
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.get('/api/admin/automations', requireAdminPerm('marketing.view', 'marketing.manage', 'content.manage'), async (_req, res, next) => {
+    try {
+      res.json({ automationFlows: await repo.adminListAutomationFlows() });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/admin/automations', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          name: z.object({ en: z.string().min(2).max(160), ar: z.string().min(1).max(160) }),
+          triggerType: z.enum(['welcome_subscriber', 'abandoned_cart', 'post_purchase', 'winback_30d']),
+          delayHours: z.number().int().min(0).max(2400).default(0),
+          subject: z.object({ en: z.string().min(1).max(220), ar: z.string().min(1).max(220) }),
+          blocks: z.array(EmailBlockSchema).min(1),
+          attachCouponCode: z.string().max(64).nullable().optional(),
+          active: z.boolean().default(true),
+        }),
+        req.body
+      );
+      const flow = await repo.adminCreateAutomationFlow(req.authUser!.id, body, getClientIp(req));
+      res.status(201).json({ automationFlow: flow });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.patch('/api/admin/automations/:id', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          name: z.object({ en: z.string().min(2).max(160), ar: z.string().min(1).max(160) }).optional(),
+          delayHours: z.number().int().min(0).max(2400).optional(),
+          subject: z.object({ en: z.string().min(1).max(220), ar: z.string().min(1).max(220) }).optional(),
+          blocks: z.array(EmailBlockSchema).min(1).optional(),
+          attachCouponCode: z.string().max(64).nullable().optional(),
+          active: z.boolean().optional(),
+        }),
+        req.body
+      );
+      const flow = await repo.adminUpdateAutomationFlow(req.params.id, req.authUser!.id, body, getClientIp(req));
+      res.json({ automationFlow: flow });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/admin/automations/run-now', requireAdminPerm('marketing.manage', 'content.manage'), async (_req, res, next) => {
+    try {
+      const summary = await processPendingJobs(db, 100);
+      res.json({ ok: true, summary });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.delete('/api/admin/automations/:id', requireAdminPerm('marketing.manage', 'content.manage'), async (req, res) => {
+    try {
+      await repo.adminDeleteAutomationFlow(req.params.id, req.authUser!.id, getClientIp(req));
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  // --- Step 6: Seller Promotion Rules & Marketing Attribution Analytics ---
+  app.get('/api/admin/marketing/seller-rules', requireAdminPerm('marketing.view', 'marketing.manage', 'content.manage'), async (_req, res, next) => {
+    try {
+      res.json({ rules: await repo.getSellerPromoRules() });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.put('/api/admin/marketing/seller-rules', requireAdminPerm('marketing.manage', 'settings.manage'), async (req, res) => {
+    try {
+      const body = validateBody(
+        z.object({
+          sellerOffersEnabled: z.boolean().optional(),
+          requireAdminApproval: z.boolean().optional(),
+          maxDiscountPercent: z.number().int().min(5).max(90).optional(),
+          maxFixedDiscountUsdCents: z.number().int().min(500).max(500000).optional(),
+          maxActiveOffersPerSeller: z.number().int().min(1).max(50).optional(),
+          allowFlashOffersBySellers: z.boolean().optional(),
+        }),
+        req.body
+      );
+      const rules = await repo.adminUpdateSellerPromoRules(req.authUser!.id, body, getClientIp(req));
+      res.json({ rules });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.get('/api/admin/marketing/analytics', requireAdminPerm('marketing.view', 'marketing.manage', 'content.manage'), async (_req, res, next) => {
+    try {
+      res.json({ analytics: await repo.getMarketingAnalytics() });
+    } catch (err) {
+      next(err);
     }
   });
 

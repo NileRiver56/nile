@@ -1,8 +1,8 @@
 import React, { useMemo, useState } from 'react';
 import { CheckCircle2, CreditCard, MessageCircle, Truck, Wallet } from 'lucide-react';
-import type { Order, PaymentMethod } from '../shared/types.ts';
+import type { Coupon, Order, PaymentMethod } from '../shared/types.ts';
 import { LEBANON_GOVERNORATES } from '../shared/lebanon.ts';
-import { resolveUnitOfferPrice } from '../shared/offers.ts';
+import { evaluateCartPromotions } from '../shared/offers.ts';
 import { useMarketplace } from '../context/MarketplaceContext.tsx';
 import { EmptyState, PriceDisplay, SectionHeading, StampBadge } from '../components/HairlineUI.tsx';
 import { OfferBannerStrip } from '../components/OfferBannerStrip.tsx';
@@ -13,6 +13,7 @@ export function CheckoutPage() {
     products,
     sellers,
     offers,
+    flashSales,
     deliveryZones,
     settings,
     paymentsConfig,
@@ -37,9 +38,7 @@ export function CheckoutPage() {
   const [transferReference, setTransferReference] = useState('');
 
   const [couponInput, setCouponInput] = useState('');
-  const [appliedCoupon, setAppliedCoupon] = useState<{ code: string; discountPercent: number; sellerId: string | null } | null>(
-    null
-  );
+  const [appliedCoupon, setAppliedCoupon] = useState<Coupon | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [confirmedOrder, setConfirmedOrder] = useState<Order | null>(null);
 
@@ -52,6 +51,25 @@ export function CheckoutPage() {
     [selectedGov, district]
   );
 
+  const promoEval = useMemo(() => {
+    const inputLines = [];
+    for (const item of cart) {
+      const product = products.find((p) => p.id === item.productId);
+      if (!product) continue;
+      const variant = product.variants.find((v) => v.id === item.variantId) || product.variants[0];
+      if (!variant) continue;
+      inputLines.push({
+        product,
+        baseUnitUsdCents: product.basePriceUsdCents + variant.priceDeltaUsdCents,
+        quantity: item.quantity,
+      });
+    }
+    return evaluateCartPromotions(inputLines, offers, flashSales, {
+      isLoggedIn: Boolean(authUser),
+      isFirstOrder: true,
+    });
+  }, [cart, products, offers, flashSales, authUser]);
+
   const sellerPreview = useMemo(() => {
     const groups = new Map<
       string,
@@ -60,20 +78,15 @@ export function CheckoutPage() {
         deliveryMode: 'self' | 'platform';
         deliveryFeeUsdCents: number;
         subtotalUsdCents: number;
+        extraOfferDiscountUsdCents: number;
         itemCount: number;
       }
     >();
 
-    for (const item of cart) {
-      const product = products.find((p) => p.id === item.productId);
-      if (!product) continue;
-      const variant = product.variants.find((v) => v.id === item.variantId) || product.variants[0];
-      const seller = sellers.find((s) => s.id === product.sellerId);
-      if (!seller || !variant) continue;
+    for (const line of promoEval.lines) {
+      const seller = sellers.find((s) => s.id === line.sellerId);
+      if (!seller) continue;
 
-      const baseUnit = product.basePriceUsdCents + variant.priceDeltaUsdCents;
-      const effUnit = resolveUnitOfferPrice(baseUnit, product, offers).effectiveUsdCents;
-      const lineTotal = effUnit * item.quantity;
       const zoneFee =
         seller.deliveryMode === 'self'
           ? seller.selfDeliveryFeesUsdCents[governorate] ?? 500
@@ -81,51 +94,74 @@ export function CheckoutPage() {
 
       const curr = groups.get(seller.id);
       if (curr) {
-        curr.subtotalUsdCents += lineTotal;
-        curr.itemCount += item.quantity;
+        curr.subtotalUsdCents += line.lineSubtotalUsdCents;
+        curr.extraOfferDiscountUsdCents += line.extraLineDiscountUsdCents;
+        curr.itemCount += line.quantity;
       } else {
         groups.set(seller.id, {
           sellerName: seller.name[locale],
           deliveryMode: seller.deliveryMode,
           deliveryFeeUsdCents: zoneFee,
-          subtotalUsdCents: lineTotal,
-          itemCount: item.quantity,
+          subtotalUsdCents: line.lineSubtotalUsdCents,
+          extraOfferDiscountUsdCents: line.extraLineDiscountUsdCents,
+          itemCount: line.quantity,
         });
       }
     }
     return groups;
-  }, [cart, products, sellers, offers, governorate, deliveryZones, locale]);
+  }, [promoEval, sellers, governorate, deliveryZones, locale]);
 
-  const subtotalUsdCents = Array.from(sellerPreview.values()).reduce((s, g) => s + g.subtotalUsdCents, 0);
-  const deliveryTotalUsdCents = Array.from(sellerPreview.values()).reduce((s, g) => s + g.deliveryFeeUsdCents, 0);
-  const discountUsdCents = useMemo(() => {
-    if (!appliedCoupon) return 0;
-    if (!appliedCoupon.sellerId) {
-      return Math.round((subtotalUsdCents * appliedCoupon.discountPercent) / 100);
+  const subtotalUsdCents = promoEval.subtotalAfterUnitOffersUsdCents;
+  const freeShippingWaived = promoEval.freeShippingApplied || appliedCoupon?.discountType === 'free_shipping';
+  const deliveryTotalUsdCents = freeShippingWaived
+    ? 0
+    : Array.from(sellerPreview.values()).reduce((s, g) => s + g.deliveryFeeUsdCents, 0);
+
+  const couponDiscountUsdCents = useMemo(() => {
+    if (!appliedCoupon || appliedCoupon.discountType === 'free_shipping') return 0;
+    const netSubtotal = Math.max(0, subtotalUsdCents - promoEval.extraOfferDiscountUsdCents);
+    const eligibleSum = appliedCoupon.sellerId
+      ? Math.max(
+          0,
+          (sellerPreview.get(appliedCoupon.sellerId)?.subtotalUsdCents || 0) -
+            (sellerPreview.get(appliedCoupon.sellerId)?.extraOfferDiscountUsdCents || 0)
+        )
+      : netSubtotal;
+    if (eligibleSum <= 0) return 0;
+    let disc =
+      appliedCoupon.discountType === 'fixed_usd_cents'
+        ? appliedCoupon.discountValue
+        : Math.round((eligibleSum * appliedCoupon.discountValue) / 100);
+    if (appliedCoupon.maxDiscountUsdCents && disc > appliedCoupon.maxDiscountUsdCents) {
+      disc = appliedCoupon.maxDiscountUsdCents;
     }
-    const target = sellerPreview.get(appliedCoupon.sellerId);
-    return target ? Math.round((target.subtotalUsdCents * appliedCoupon.discountPercent) / 100) : 0;
-  }, [appliedCoupon, subtotalUsdCents, sellerPreview]);
+    return Math.min(Math.max(0, eligibleSum - 1), disc);
+  }, [appliedCoupon, subtotalUsdCents, promoEval.extraOfferDiscountUsdCents, sellerPreview]);
 
+  const totalDiscountUsdCents = promoEval.extraOfferDiscountUsdCents + couponDiscountUsdCents;
   const codFeeUsdCents = paymentMethod === 'cod' ? settings.codFeeUsdCents : 0;
-  const grandTotalUsdCents = subtotalUsdCents - discountUsdCents + deliveryTotalUsdCents + codFeeUsdCents;
+  const grandTotalUsdCents = Math.max(0, subtotalUsdCents - totalDiscountUsdCents) + deliveryTotalUsdCents + codFeeUsdCents;
 
   const handleApplyCoupon = async () => {
     if (!couponInput.trim()) return;
     try {
-      const res = await apiFetch<{ coupon: { code: string; discountPercent: number; sellerId: string | null } }>(
-        '/api/coupons/validate',
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            code: couponInput.trim(),
-            subtotalUsdCents,
-            sellerIds: Array.from(sellerPreview.keys()),
-          }),
-        }
-      );
+      const res = await apiFetch<{ coupon: Coupon }>('/api/coupons/validate', {
+        method: 'POST',
+        body: JSON.stringify({
+          code: couponInput.trim(),
+          subtotalUsdCents,
+          sellerIds: Array.from(sellerPreview.keys()),
+          customerPhone,
+        }),
+      });
       setAppliedCoupon(res.coupon);
-      showToast(`Applied ${res.coupon.code} (${res.coupon.discountPercent}% off)`, 'success');
+      const label =
+        res.coupon.discountType === 'free_shipping'
+          ? 'Free Shipping'
+          : res.coupon.discountType === 'fixed_usd_cents'
+            ? `$${(res.coupon.discountValue / 100).toFixed(2)} off`
+            : `${res.coupon.discountValue}% off`;
+      showToast(`Applied ${res.coupon.code} (${label})`, 'success');
     } catch (err) {
       showToast((err as Error).message, 'error');
     }
@@ -449,7 +485,13 @@ export function CheckoutPage() {
               </div>
               <div className="flex justify-between text-[var(--muted)]">
                 <span>{t.deliveryEst}</span>
-                <PriceDisplay usdCents={deliveryTotalUsdCents} size="sm" />
+                {freeShippingWaived ? (
+                  <span className="font-mono-tabular text-xs font-bold text-[var(--cedar)] uppercase">
+                    {locale === 'ar' ? 'توصيل مجاني' : 'FREE SHIPPING'}
+                  </span>
+                ) : (
+                  <PriceDisplay usdCents={deliveryTotalUsdCents} size="sm" />
+                )}
               </div>
               {codFeeUsdCents > 0 && (
                 <div className="flex justify-between text-[var(--muted)]">
@@ -457,12 +499,21 @@ export function CheckoutPage() {
                   <PriceDisplay usdCents={codFeeUsdCents} size="sm" />
                 </div>
               )}
-              {discountUsdCents > 0 && (
+              {promoEval.extraOfferDiscountUsdCents > 0 && (
+                <div className="flex justify-between text-[var(--cedar)]">
+                  <span>
+                    {locale === 'ar' ? 'خصم العروض التلقائي' : 'Auto Promotions'}
+                    {promoEval.appliedPromoTitles.length > 0 ? ` (${promoEval.appliedPromoTitles[0]})` : ''}
+                  </span>
+                  <PriceDisplay usdCents={-promoEval.extraOfferDiscountUsdCents} size="sm" />
+                </div>
+              )}
+              {couponDiscountUsdCents > 0 && (
                 <div className="flex justify-between text-[var(--cedar)]">
                   <span>
                     {t.discount} ({appliedCoupon?.code})
                   </span>
-                  <PriceDisplay usdCents={-discountUsdCents} size="sm" />
+                  <PriceDisplay usdCents={-couponDiscountUsdCents} size="sm" />
                 </div>
               )}
               <div className="flex justify-between items-baseline pt-3 border-t border-[var(--line)]">

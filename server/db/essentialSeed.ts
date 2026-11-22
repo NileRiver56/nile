@@ -132,6 +132,14 @@ const ESSENTIAL_EMAIL_TEMPLATES = [
     subject: { en: 'Payout settled — {{amount}}', ar: 'تم تحويل أرباحك — {{amount}}' },
     body: { en: 'Transfer reference: {{reference}}.', ar: 'رقم مرجع التحويل: {{reference}}.' },
   },
+  {
+    key: 'password_reset',
+    subject: { en: 'Reset your NileLink password', ar: 'إعادة تعيين كلمة مرور نايل لينك' },
+    body: {
+      en: 'Hello {{name}}, use password reset token {{token}} or open {{link}} within 60 minutes.',
+      ar: 'مرحباً {{name}}، استخدم رمز إعادة تعيين كلمة المرور {{token}} أو افتح الرابط {{link}} خلال 60 دقيقة.',
+    },
+  },
 ];
 
 const ESSENTIAL_PAGES = [
@@ -432,6 +440,20 @@ export async function ensureEssentialSeed(db: DbClient): Promise<{ firstRunSetup
         : 'INSERT OR IGNORE INTO pages (id, slug, title_json, body_json, published) VALUES (?, ?, ?, ?, 1)',
       [pg.id, pg.slug, JSON.stringify(pg.title), JSON.stringify(pg.body)]
     );
+  }
+
+  const menuCount = await db.queryOne<{ cnt: number }>('SELECT COUNT(*) as cnt FROM menus');
+  if (!menuCount || Number(menuCount.cnt) === 0) {
+    await db.execute('INSERT INTO menus (id, location, items_json) VALUES (?, ?, ?)', [
+      'menu-header',
+      'header',
+      JSON.stringify(DEFAULT_SITE_CHROME.headerLinks.map((l) => ({ label: l.label, url: l.url }))),
+    ]);
+    await db.execute('INSERT INTO menus (id, location, items_json) VALUES (?, ?, ?)', [
+      'menu-footer',
+      'footer',
+      JSON.stringify(DEFAULT_SITE_CHROME.footerColumns.flatMap((c) => c.links)),
+    ]);
   }
 
   // 6. Platform Settings (no demo announcement, clean production defaults)

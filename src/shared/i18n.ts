@@ -93,6 +93,20 @@ const EN = {
   newsletterDesc: 'Updates on new verified merchant storefronts across Lebanon.',
   subscribe: 'Subscribe',
   footerCopy: 'NileLink Marketplace · Lebanon',
+  navAccount: 'Account',
+  navSupport: 'Support',
+  signIn: 'Sign In',
+  register: 'Create Account',
+  forgotPassword: 'Forgot Password',
+  resetPassword: 'Reset Password',
+  savedAddresses: 'Saved Addresses',
+  notifications: 'Notifications',
+  supportCenter: 'Support & Help Center',
+  requestReturn: 'Request Return',
+  openDispute: 'Open Dispute',
+  twoFactorAuth: 'Two-Factor Authentication',
+  logoutAllDevices: 'Sign Out All Devices',
+  profileSettings: 'Profile & Preferences',
 };
 
 const AR: typeof EN = {
@@ -188,6 +202,20 @@ const AR: typeof EN = {
   newsletterDesc: 'تنبيهات المتاجر اللبنانية الموثقة عند إطلاقها.',
   subscribe: 'اشتراك',
   footerCopy: 'منصة نايل لينك · لبنان',
+  navAccount: 'حسابي',
+  navSupport: 'الدعم',
+  signIn: 'تسجيل الدخول',
+  register: 'إنشاء حساب',
+  forgotPassword: 'نسيت كلمة المرور',
+  resetPassword: 'إعادة تعيين كلمة المرور',
+  savedAddresses: 'العناوين المحفوظة',
+  notifications: 'الإشعارات',
+  supportCenter: 'مركز الدعم والمساعدة',
+  requestReturn: 'طلب إرجاع',
+  openDispute: 'فتح نزاع',
+  twoFactorAuth: 'المصادقة الثنائية',
+  logoutAllDevices: 'تسجيل الخروج من كل الأجهزة',
+  profileSettings: 'الملف الشخصي والتفضيلات',
 };
 
 export function getCopy(locale: Locale) {

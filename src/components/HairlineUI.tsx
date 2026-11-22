@@ -180,12 +180,14 @@ export function ProductCard({
   product: Product;
   seller?: Seller;
 }) {
-  const { locale, navigate, addToCart, wishlist, toggleWishlist, t, offers } = useMarketplace();
+  const { locale, navigate, addToCart, wishlist, toggleWishlist, t, offers, flashSales, authUser } = useMarketplace();
   const isWished = wishlist.includes(product.id);
   const defaultVariant = product.variants.find((v) => v.stock > 0) || product.variants[0];
   const inStock = product.variants.some((v) => v.stock > 0);
   const accent = getDepartmentAccent(product.department);
-  const resolved = resolveUnitOfferPrice(product.basePriceUsdCents, product, offers);
+  const resolved = resolveUnitOfferPrice(product.basePriceUsdCents, product, offers, Date.now(), flashSales, {
+    isLoggedIn: Boolean(authUser),
+  });
 
   return (
     <article
@@ -249,13 +251,22 @@ export function ProductCard({
 
       <div className="mt-4 pt-3 border-t border-[var(--line)] flex items-end justify-between gap-3">
         <div>
-          {resolved.appliedOffer && (
+          {resolved.appliedFlashItem ? (
             <p className="text-[11px] font-mono-tabular uppercase tracking-wider text-[var(--ember)] mb-1">
-              {resolved.appliedOffer.offerType === 'fixed_usd_cents'
-                ? `-$${(resolved.appliedOffer.discountValue / 100).toFixed(2)}`
-                : `-${resolved.appliedOffer.discountValue}%`}{' '}
-              · {resolved.appliedOffer.title[locale]}
+              FLASH -{resolved.appliedFlashItem.discountPercent}%
+              {resolved.appliedFlashItem.stockCap > 0
+                ? ` · ${Math.max(0, resolved.appliedFlashItem.stockCap - resolved.appliedFlashItem.claimedCount)} left`
+                : ''}
             </p>
+          ) : (
+            resolved.appliedOffer && (
+              <p className="text-[11px] font-mono-tabular uppercase tracking-wider text-[var(--ember)] mb-1">
+                {resolved.appliedOffer.offerType === 'fixed_usd_cents'
+                  ? `-$${(resolved.appliedOffer.discountValue / 100).toFixed(2)}`
+                  : `-${resolved.appliedOffer.discountValue}%`}{' '}
+                · {resolved.appliedOffer.title[locale]}
+              </p>
+            )
           )}
           <PriceDisplay usdCents={resolved.effectiveUsdCents} compareAtUsdCents={resolved.compareAtUsdCents} size="sm" />
           <div className="mt-1.5 flex items-center gap-2">

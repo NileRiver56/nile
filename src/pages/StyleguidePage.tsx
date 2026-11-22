@@ -210,6 +210,51 @@ export function StyleguidePage() {
           />
         </div>
       </section>
+
+      {/* Home Builder & Marketing Hub Patterns */}
+      <section className="space-y-4">
+        <SectionHeading
+          title="Home Builder & Marketing Hub Matrix"
+          subtitle="Zero-pill rectangular indicators, flash sale countdown framing, and bilingual block specimens."
+        />
+        <div className="hairline-grid grid-cols-1 md:grid-cols-3">
+          <div className="hairline-cell p-6 space-y-3">
+            <p className="text-xs font-mono-tabular uppercase text-[var(--muted)]">Offer &amp; Moderation Badges</p>
+            <div className="flex flex-wrap gap-2 text-[11px] font-mono-tabular uppercase">
+              <span className="border border-[var(--ember)] px-2 py-0.5 text-[var(--ember)]">Flash -30%</span>
+              <span className="border border-[var(--cedar)] px-2 py-0.5 text-[var(--cedar)]">Approved</span>
+              <span className="border border-[var(--gold)] px-2 py-0.5 text-[var(--gold)]">Pending Review</span>
+              <span className="border border-[var(--cyan)] px-2 py-0.5 text-[var(--cyan)]">Segment Match</span>
+            </div>
+            <p className="text-xs text-[var(--muted)]">
+              Sharp 1px rectangular frames preserve grid alignment without rounded pills.
+            </p>
+          </div>
+
+          <div className="hairline-cell p-6 space-y-3">
+            <p className="text-xs font-mono-tabular uppercase text-[var(--muted)]">Flash Sale Stock Cap Meter</p>
+            <div className="border border-[var(--line)] bg-[var(--ink)] p-3 space-y-2">
+              <div className="flex justify-between text-xs font-mono-tabular">
+                <span className="text-[var(--bone)]">Ends in 04:18:22</span>
+                <span className="text-[var(--ember)]">18 / 25 claimed</span>
+              </div>
+              <div className="h-1.5 w-full bg-[var(--graphite)] border border-[var(--line)]">
+                <div className="h-full bg-[var(--ember)] w-[72%]" />
+              </div>
+            </div>
+          </div>
+
+          <div className="hairline-cell p-6 space-y-3">
+            <p className="text-xs font-mono-tabular uppercase text-[var(--muted)]">Email Coupon Box Specimen</p>
+            <div className="border border-dashed border-[var(--gold)] bg-[var(--ink)] p-3 text-center">
+              <div className="text-[11px] text-[var(--muted)]">Checkout Promo Code</div>
+              <div className="font-mono-tabular text-lg font-bold tracking-widest text-[var(--gold)] mt-1">
+                BEIRUT25
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
     </div>
   );
 }

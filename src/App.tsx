@@ -15,6 +15,9 @@ import { SellerDashboardPage } from './pages/SellerDashboardPage.tsx';
 import { AdminDashboardPage } from './pages/AdminDashboardPage.tsx';
 import { StyleguidePage } from './pages/StyleguidePage.tsx';
 import { LegalPage } from './pages/LegalPage.tsx';
+import { CampaignPage } from './pages/CampaignPage.tsx';
+import { AccountPage } from './pages/AccountPage.tsx';
+import { SupportPage } from './pages/SupportPage.tsx';
 import { MarketingOverlayManager } from './components/MarketingOverlayManager.tsx';
 
 function ToastBanner() {
@@ -58,7 +61,13 @@ function RouterView() {
   if (pathname === '/seller') return <SellerDashboardPage />;
   if (pathname === '/admin') return <AdminDashboardPage />;
   if (pathname === '/styleguide') return <StyleguidePage />;
+  if (pathname.startsWith('/campaign/')) {
+    const slug = pathname.replace('/campaign/', '');
+    return <CampaignPage slug={slug} />;
+  }
   if (pathname === '/legal') return <LegalPage />;
+  if (pathname === '/account') return <AccountPage />;
+  if (pathname === '/support') return <SupportPage />;
 
   return <HomePage />;
 }

@@ -1,12 +1,17 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import type {
+  AttributeItem,
+  BrandItem,
+  Campaign,
   Category,
   Currency,
   DeliveryZone,
   FeaturedPlacement,
+  FlashSale,
   HomeSection,
   Locale,
   MarketingPopup,
+  NotificationItem,
   Offer,
   OfferBanner,
   PaymentConfig,
@@ -35,6 +40,8 @@ export interface AuthSessionUser {
   roleKey: UserRole;
   sellerId?: string;
   totpEnabled: boolean;
+  preferredLocale?: Locale;
+  preferredCurrency?: Currency;
   permissions: string[];
 }
 
@@ -60,6 +67,8 @@ interface MarketplaceContextValue {
   settings: PlatformSettings;
   paymentsConfig: PaymentConfig;
   categories: Category[];
+  brands: BrandItem[];
+  attributes: AttributeItem[];
   sellers: Seller[];
   products: Product[];
   subscriptionPlans: SubscriptionPlan[];
@@ -70,11 +79,15 @@ interface MarketplaceContextValue {
   popups: MarketingPopup[];
   featuredPlacements: FeaturedPlacement[];
   offers: Offer[];
+  flashSales: FlashSale[];
+  campaigns: Campaign[];
   previewDrafts: boolean;
   setPreviewDrafts: (v: boolean) => void;
   loading: boolean;
   refreshBootstrap: () => Promise<void>;
   refreshAuth: () => Promise<void>;
+  unreadNotificationsCount: number;
+  refreshNotifications: () => Promise<void>;
   cart: CartItem[];
   addToCart: (productId: string, variantId: string, quantity?: number) => void;
   updateCartQty: (productId: string, variantId: string, quantity: number) => void;
@@ -144,6 +157,8 @@ export function MarketplaceProvider({ children }: { children: React.ReactNode })
   const [settings, setSettings] = useState<PlatformSettings>(DEFAULT_SETTINGS);
   const [paymentsConfig, setPaymentsConfig] = useState<PaymentConfig>(DEFAULT_PAYMENTS);
   const [categories, setCategories] = useState<Category[]>([]);
+  const [brands, setBrands] = useState<BrandItem[]>([]);
+  const [attributes, setAttributes] = useState<AttributeItem[]>([]);
   const [sellers, setSellers] = useState<Seller[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
   const [subscriptionPlans, setSubscriptionPlans] = useState<SubscriptionPlan[]>([]);
@@ -154,6 +169,9 @@ export function MarketplaceProvider({ children }: { children: React.ReactNode })
   const [popups, setPopups] = useState<MarketingPopup[]>([]);
   const [featuredPlacements, setFeaturedPlacements] = useState<FeaturedPlacement[]>([]);
   const [offers, setOffers] = useState<Offer[]>([]);
+  const [flashSales, setFlashSales] = useState<FlashSale[]>([]);
+  const [campaigns, setCampaigns] = useState<Campaign[]>([]);
+  const [unreadNotificationsCount, setUnreadNotificationsCount] = useState(0);
   const [previewDrafts, setPreviewDrafts] = useState<boolean>(() => {
     const p = new URLSearchParams(window.location.search);
     return p.get('previewDrafts') === '1' || p.get('previewDrafts') === 'true';
@@ -269,6 +287,8 @@ export function MarketplaceProvider({ children }: { children: React.ReactNode })
       setSettings(data.settings || DEFAULT_SETTINGS);
       setPaymentsConfig(data.paymentsConfig || DEFAULT_PAYMENTS);
       setCategories(data.categories || []);
+      setBrands(data.brands || []);
+      setAttributes(data.attributes || []);
       setSellers(data.sellers || []);
       setProducts(data.products || []);
       setSubscriptionPlans(data.subscriptionPlans || []);
@@ -279,12 +299,23 @@ export function MarketplaceProvider({ children }: { children: React.ReactNode })
       setPopups(data.popups || []);
       setFeaturedPlacements(data.featuredPlacements || []);
       setOffers(data.offers || []);
+      setFlashSales(data.flashSales || []);
+      setCampaigns(data.campaigns || []);
     } catch {
       showToast('Failed to load marketplace catalog.', 'error');
     } finally {
       setLoading(false);
     }
   }, [locale, previewDrafts, showToast]);
+
+  const refreshNotifications = useCallback(async () => {
+    try {
+      const data = await apiFetch<{ notifications: NotificationItem[] }>('/api/account/notifications');
+      setUnreadNotificationsCount((data.notifications || []).filter((n) => !n.readAt).length);
+    } catch {
+      setUnreadNotificationsCount(0);
+    }
+  }, [apiFetch]);
 
   const refreshAuth = useCallback(async () => {
     try {
@@ -296,9 +327,11 @@ export function MarketplaceProvider({ children }: { children: React.ReactNode })
         if (Array.isArray(data.wishlist)) setWishlist(data.wishlist);
       } else {
         setAuthUser(null);
+        setUnreadNotificationsCount(0);
       }
     } catch {
       setAuthUser(null);
+      setUnreadNotificationsCount(0);
     }
   }, []);
 
@@ -309,6 +342,14 @@ export function MarketplaceProvider({ children }: { children: React.ReactNode })
   useEffect(() => {
     void refreshBootstrap();
   }, [refreshBootstrap, authUser?.id]);
+
+  useEffect(() => {
+    if (authUser) {
+      void refreshNotifications();
+    } else {
+      setUnreadNotificationsCount(0);
+    }
+  }, [authUser, refreshNotifications]);
 
   const syncCartRemote = useCallback(
     (nextCart: CartItem[]) => {
@@ -443,6 +484,8 @@ export function MarketplaceProvider({ children }: { children: React.ReactNode })
         settings,
         paymentsConfig,
         categories,
+        brands,
+        attributes,
         sellers,
         products,
         subscriptionPlans,
@@ -453,11 +496,15 @@ export function MarketplaceProvider({ children }: { children: React.ReactNode })
         popups,
         featuredPlacements,
         offers,
+        flashSales,
+        campaigns,
         previewDrafts,
         setPreviewDrafts,
         loading,
         refreshBootstrap,
         refreshAuth,
+        unreadNotificationsCount,
+        refreshNotifications,
         cart,
         addToCart,
         updateCartQty,
